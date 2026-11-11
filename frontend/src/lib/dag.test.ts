@@ -35,4 +35,29 @@ describe('DAG 布局与连线', () => {
     expect(result.edges).toEqual([]);
     expect(result.nodes).toHaveLength(2);
   });
+
+  it('双节点父子环只保留单边并形成有根布局', () => {
+    const result = layoutSpans([makeSpan('a', 0, 'b'), makeSpan('b', 1, 'a')]);
+    expect(result.edges).toHaveLength(1);
+    const pairs = result.edges.map((edge) => `${edge.source}->${edge.target}`);
+    expect(pairs.includes('a->b') !== pairs.includes('b->a')).toBe(true);
+    expect(result.nodes.some((node) => node.position.x === 0)).toBe(true);
+  });
+
+  it('三节点环移除回边而保留其余父子关系', () => {
+    const result = layoutSpans([
+      makeSpan('a', 0, 'c'), makeSpan('b', 1, 'a', 'tool'), makeSpan('c', 2, 'b'),
+    ]);
+    expect(result.edges).toHaveLength(2);
+    const next = new Map(result.edges.map((edge) => [edge.source, edge.target]));
+    for (const id of ['a', 'b', 'c']) {
+      const seen = new Set<string>();
+      let cursor: string | undefined = id;
+      while (cursor && next.has(cursor)) {
+        expect(seen.has(cursor)).toBe(false);
+        seen.add(cursor);
+        cursor = next.get(cursor);
+      }
+    }
+  });
 });

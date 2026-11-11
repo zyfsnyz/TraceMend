@@ -19,7 +19,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-
 NONSTREAM_MARKER = "SMOKE_NONSTREAM_杭州_7f3a"
 STREAM_MARKER = "SMOKE_STREAM_苏州_91bc"
 MCP_MARKER = "SMOKE_MCP_天气_2d8e"
@@ -36,7 +35,7 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
     stream_finished = threading.Event()
     stream_timeout = 30.0
 
-    def do_POST(self) -> None:  # noqa: N802 - http.server 接口
+    def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
         if self.path != "/v1/chat/completions":
@@ -116,7 +115,7 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
 class MockMCPHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def do_POST(self) -> None:  # noqa: N802 - http.server 接口
+    def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
         if self.path != "/mcp" or request.get("method") != "tools/call":
@@ -203,8 +202,7 @@ def sse_request_incremental(
                             raise AssertionError("首个含标记 chunk 到达前上游已结束或被 release")
                         break
                 upstream_release.set()
-                for line in response:
-                    lines.append(line)
+                lines.extend(response)
                 return Response(response.status, response.headers, b"".join(lines))
         except urllib.error.HTTPError as exc:
             return Response(exc.code, exc.headers, exc.read())
@@ -282,7 +280,7 @@ class SmokeTest:
     def assert_usage(self, detail: dict[str, Any]) -> None:
         trace = detail.get("trace") or {}
         candidates = [trace.get("total_tokens")]
-        candidates.extend((item.get("total_tokens") for item in detail.get("spans", [])))
+        candidates.extend(item.get("total_tokens") for item in detail.get("spans", []))
         if not any(isinstance(value, (int, float)) and value > 0 for value in candidates):
             raise AssertionError(f"未找到正数 total_tokens：{candidates}")
 
@@ -299,7 +297,7 @@ class SmokeTest:
                 if response.status not in (200, 204, 404):
                     expect_status(response)
                 print(f"[清理] 已删除 {trace_id}")
-            except Exception as exc:  # 单个失败不能阻止清理其余本次 Trace
+            except Exception as exc:  # noqa: BLE001 - 单个清理失败不应阻断其余记录
                 errors.append(f"{trace_id}: {exc}")
         if errors:
             raise AssertionError("部分 Trace 清理失败：" + "；".join(errors))
@@ -316,7 +314,7 @@ def run_checks(smoke: SmokeTest, timeout: float) -> None:
     with ExitStack() as stack:
         openai_base = start_server(stack, MockOpenAIHandler)
         mcp_url = start_server(stack, MockMCPHandler) + "/mcp"
-        print(f"[1/7] 本地模拟上游已启动（仅 127.0.0.1，随机端口）")
+        print("[1/7] 本地模拟上游已启动（仅 127.0.0.1，随机端口）")
 
         health = smoke.api("GET", "/api/health")
         expect_status(health)

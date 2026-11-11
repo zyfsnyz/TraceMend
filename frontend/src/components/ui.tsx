@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { AlertCircle, Check, Clipboard, Inbox, LoaderCircle, X } from 'lucide-react';
 import { stringifySafe } from '../lib/sensitive';
 import type { JsonValue } from '../api/types';
@@ -39,32 +39,66 @@ export function JsonBlock({ value }: { value: JsonValue | Record<string, unknown
 }
 
 export function CopyButton({ text, label = '复制' }: { text: string; label?: string }) {
-  const [copied, setCopied] = useState(false);
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle');
   const copy = async () => {
+    let succeeded = false;
     try {
       await navigator.clipboard.writeText(text);
+      succeeded = true;
     } catch {
       const area = document.createElement('textarea');
       area.value = text; area.style.position = 'fixed'; area.style.opacity = '0';
-      document.body.appendChild(area); area.select(); document.execCommand('copy'); area.remove();
+      document.body.appendChild(area); area.select();
+      try { succeeded = document.execCommand('copy'); } catch { succeeded = false; }
+      area.remove();
     }
-    setCopied(true);
+    setCopyStatus(succeeded ? 'copied' : 'failed');
   };
   useEffect(() => {
-    if (!copied) return;
-    const timer = window.setTimeout(() => setCopied(false), 1800);
+    if (copyStatus === 'idle') return;
+    const timer = window.setTimeout(() => setCopyStatus('idle'), 1800);
     return () => window.clearTimeout(timer);
-  }, [copied]);
-  return <button className="btn-secondary h-8 px-2.5 text-xs" onClick={copy}>{copied ? <Check size={13} className="text-teal-600" /> : <Clipboard size={13} />}{copied ? '已复制' : label}</button>;
+  }, [copyStatus]);
+  return <button className="btn-secondary h-8 px-2.5 text-xs" onClick={copy} aria-live="polite">{copyStatus === 'copied' ? <Check size={13} className="text-teal-600" /> : copyStatus === 'failed' ? <X size={13} className="text-red-500" /> : <Clipboard size={13} />}{copyStatus === 'copied' ? '已复制' : copyStatus === 'failed' ? '复制失败' : label}</button>;
 }
 
 export function Modal({ title, children, onClose }: { title: string; children: ReactNode; onClose: () => void }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusable = () => Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ) ?? []);
+    focusable()[0]?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const items = focusable();
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !dialogRef.current?.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !dialogRef.current?.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
     document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
-  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink-950/45 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="w-full max-w-md rounded-xl border border-white/20 bg-white shadow-float" role="dialog" aria-modal="true" aria-label={title}><div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><h2 className="font-semibold text-ink-900">{title}</h2><button className="icon-button h-8 w-8" aria-label="关闭" onClick={onClose}><X size={18} /></button></div><div className="p-5">{children}</div></div></div>;
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      previousFocus?.focus();
+    };
+  }, []);
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink-950/45 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div ref={dialogRef} tabIndex={-1} className="w-full max-w-md rounded-xl border border-white/20 bg-white shadow-float" role="dialog" aria-modal="true" aria-label={title}><div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><h2 className="font-semibold text-ink-900">{title}</h2><button className="icon-button h-8 w-8" aria-label="关闭" onClick={onClose}><X size={18} /></button></div><div className="p-5">{children}</div></div></div>;
 }
 
 export function InlineNotice({ tone = 'info', children }: { tone?: 'info' | 'success' | 'error'; children: ReactNode }) {

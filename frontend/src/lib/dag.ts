@@ -23,6 +23,20 @@ export function layoutSpans(input: Span[]): { nodes: SpanFlowNode[]; edges: Edge
     if (parent && parent !== span.id && ids.has(parent)) validParents.set(span.id, parent);
   }
 
+  // Reject only edges that close a cycle (DFS three-colour), keeping the graph a rooted DAG.
+  const visitState = new Map<string, 1 | 2>();
+  const stabilise = (id: string): boolean => {
+    const state = visitState.get(id);
+    if (state === 1) return false;
+    if (state === 2) return true;
+    visitState.set(id, 1);
+    const parent = validParents.get(id);
+    if (parent && !stabilise(parent)) validParents.delete(id);
+    visitState.set(id, 2);
+    return true;
+  };
+  for (const span of spans) stabilise(span.id);
+
   const edges: Edge[] = [];
   if (validParents.size > 0) {
     for (const span of spans) {

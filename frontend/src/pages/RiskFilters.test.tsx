@@ -25,17 +25,17 @@ describe('风险筛选后端契约', () => {
   it('风险中心默认请求 risk=any', async () => {
     renderAt(<RisksPage />, '/risks');
 
-    await waitFor(() => expect(getTraces).toHaveBeenCalledWith({ risk: 'any', q: '', page: 1, page_size: 20 }));
+    await waitFor(() => expect(getTraces).toHaveBeenCalledWith({ risk: 'any', q: '', page: 1, page_size: 20 }, expect.any(AbortSignal)));
   });
 
   it('风险中心从具体严重度切回全部风险时把 URL 与请求更新为 any', async () => {
     const user = userEvent.setup();
     renderAt(<RisksPage />, '/risks?risk=high');
-    await waitFor(() => expect(getTraces).toHaveBeenCalledWith({ risk: 'high', q: '', page: 1, page_size: 20 }));
+    await waitFor(() => expect(getTraces).toHaveBeenCalledWith({ risk: 'high', q: '', page: 1, page_size: 20 }, expect.any(AbortSignal)));
 
     await user.click(screen.getByRole('button', { name: '全部风险' }));
 
-    await waitFor(() => expect(getTraces).toHaveBeenLastCalledWith({ risk: 'any', q: '', page: 1, page_size: 20 }));
+    await waitFor(() => expect(getTraces).toHaveBeenLastCalledWith({ risk: 'any', q: '', page: 1, page_size: 20 }, expect.any(AbortSignal)));
     expect(screen.getByRole('button', { name: '全部风险' })).toHaveClass('bg-white');
   });
 
@@ -46,7 +46,7 @@ describe('风险筛选后端契约', () => {
 
     await user.selectOptions(screen.getByRole('combobox', { name: '风险筛选' }), 'none');
 
-    await waitFor(() => expect(getTraces).toHaveBeenLastCalledWith(expect.objectContaining({ risk: 'none', page: 1 })));
+    await waitFor(() => expect(getTraces).toHaveBeenLastCalledWith(expect.objectContaining({ risk: 'none', page: 1 }), expect.any(AbortSignal)));
     expect(screen.getByRole('option', { name: '仅看有风险' })).toHaveValue('any');
   });
 });

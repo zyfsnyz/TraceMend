@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, ArrowRight, CalendarDays, ChevronRight, Filter, RefreshCw, Search, Trash2, X } from 'lucide-react';
 import { deleteTrace, getTraces } from '../api/client';
 import type { Trace, TraceListResponse } from '../api/types';
-import { formatDuration, formatNumber, formatTime, shortId } from '../lib/format';
+import { dateInputFromIso, formatDuration, formatNumber, formatTime, localDayEnd, localDayStart, shortId } from '../lib/format';
 import { EmptyState, ErrorState, Modal, Spinner, StatusBadge } from '../components/ui';
 
 export function TracesPage() {
@@ -14,26 +14,39 @@ export function TracesPage() {
   const [error, setError] = useState('');
   const [q, setQ] = useState(searchParams.get('q') ?? '');
   const [tag, setTag] = useState(searchParams.get('tag') ?? '');
-  const [from, setFrom] = useState(searchParams.get('from') ?? '');
-  const [to, setTo] = useState(searchParams.get('to') ?? '');
+  const [from, setFrom] = useState(dateInputFromIso(searchParams.get('from')));
+  const [to, setTo] = useState(dateInputFromIso(searchParams.get('to')));
   const [showAdvanced, setShowAdvanced] = useState(Boolean(searchParams.get('tag') || searchParams.get('from') || searchParams.get('to')));
   const [deleting, setDeleting] = useState<Trace | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
+  const requestRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
   const page = Math.max(1, Number(searchParams.get('page')) || 1);
   const pageSize = Number(searchParams.get('page_size')) || 20;
 
   const load = useCallback(async () => {
+    const requestId = ++requestRef.current;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setLoading(true); setError('');
     try {
       const result = await getTraces({
         q: searchParams.get('q') ?? '', status: searchParams.get('status') ?? '', risk: searchParams.get('risk') ?? '',
         tag: searchParams.get('tag') ?? '', from: searchParams.get('from') ?? '', to: searchParams.get('to') ?? '', page, page_size: pageSize,
-      });
+      }, controller.signal);
+      if (requestId !== requestRef.current || controller.signal.aborted) return;
       setData(result);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '未知错误'); }
-    finally { setLoading(false); }
+    } catch (reason) {
+      if (requestId !== requestRef.current || controller.signal.aborted) return;
+      setError(reason instanceof Error ? reason.message : '未知错误');
+    }
+    finally { if (requestId === requestRef.current) setLoading(false); }
   }, [page, pageSize, searchParams]);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load();
+    return () => abortRef.current?.abort();
+  }, [load]);
 
   const updateFilters = (updates: Record<string, string | number>) => {
     const next = new URLSearchParams(searchParams);
@@ -60,7 +73,7 @@ export function TracesPage() {
   return <div className="mx-auto max-w-[1600px] p-5 md:p-7 xl:p-8">
     <header className="mb-6 flex flex-wrap items-start justify-between gap-4"><div><h1 className="page-title">审计链路</h1><p className="page-subtitle">检索完整 Agent 执行记录，深入每个 Span 的输入、输出与风险证据。</p></div><button className="btn-secondary" onClick={() => void load()} disabled={loading}><RefreshCw size={14} className={loading ? 'animate-spin' : ''} />刷新</button></header>
     <section className="panel mb-4 p-4">
-      <form className="flex flex-wrap items-center gap-2.5" onSubmit={(event) => { event.preventDefault(); updateFilters({ q: q.trim(), tag: tag.trim(), from, to }); }}>
+      <form className="flex flex-wrap items-center gap-2.5" onSubmit={(event) => { event.preventDefault(); updateFilters({ q: q.trim(), tag: tag.trim(), from: localDayStart(from), to: localDayEnd(to) }); }}>
         <div className="relative min-w-[220px] flex-1"><Search className="absolute left-3 top-3 text-slate-400" size={16} /><input className="input w-full pl-9" value={q} onChange={(event) => setQ(event.target.value)} placeholder="搜索链路名称、ID、模型或来源" aria-label="搜索链路" /></div>
         <select className="input w-32" aria-label="状态筛选" value={searchParams.get('status') ?? ''} onChange={(event) => updateFilters({ status: event.target.value })}><option value="">全部状态</option><option value="completed">已完成</option><option value="running">运行中</option><option value="error">异常</option></select>
         <select className="input w-32" aria-label="风险筛选" value={searchParams.get('risk') ?? ''} onChange={(event) => updateFilters({ risk: event.target.value })}><option value="">全部风险</option><option value="any">仅看有风险</option><option value="high">高风险</option><option value="medium">中风险</option><option value="low">低风险</option><option value="none">无风险</option></select>
@@ -68,7 +81,7 @@ export function TracesPage() {
         <button className={`btn-secondary ${showAdvanced ? 'border-teal-200 text-teal-700' : ''}`} type="button" onClick={() => setShowAdvanced((value) => !value)}><Filter size={14} />更多</button>
         {hasFilters && <button className="icon-button h-9 w-9" type="button" aria-label="清空筛选" title="清空筛选" onClick={reset}><X size={16} /></button>}
       </form>
-      {showAdvanced && <div className="mt-3 grid gap-3 border-t border-slate-100 pt-3 sm:grid-cols-2 xl:grid-cols-4"><div><label className="label" htmlFor="trace-tag">标签</label><input id="trace-tag" className="input w-full" value={tag} onChange={(event) => setTag(event.target.value)} placeholder="例如 production" /></div><div><label className="label" htmlFor="trace-from">开始日期</label><div className="relative"><CalendarDays className="pointer-events-none absolute left-3 top-3 text-slate-400" size={14} /><input id="trace-from" type="date" className="input w-full pl-9" value={from} onChange={(event) => setFrom(event.target.value)} /></div></div><div><label className="label" htmlFor="trace-to">结束日期</label><div className="relative"><CalendarDays className="pointer-events-none absolute left-3 top-3 text-slate-400" size={14} /><input id="trace-to" type="date" className="input w-full pl-9" value={to} onChange={(event) => setTo(event.target.value)} /></div></div><div className="flex items-end"><button className="btn-secondary w-full" onClick={() => updateFilters({ q: q.trim(), tag: tag.trim(), from, to })}>应用高级筛选</button></div></div>}
+      {showAdvanced && <div className="mt-3 grid gap-3 border-t border-slate-100 pt-3 sm:grid-cols-2 xl:grid-cols-4"><div><label className="label" htmlFor="trace-tag">标签</label><input id="trace-tag" className="input w-full" value={tag} onChange={(event) => setTag(event.target.value)} placeholder="例如 production" /></div><div><label className="label" htmlFor="trace-from">开始日期</label><div className="relative"><CalendarDays className="pointer-events-none absolute left-3 top-3 text-slate-400" size={14} /><input id="trace-from" type="date" className="input w-full pl-9" value={from} onChange={(event) => setFrom(event.target.value)} /></div></div><div><label className="label" htmlFor="trace-to">结束日期</label><div className="relative"><CalendarDays className="pointer-events-none absolute left-3 top-3 text-slate-400" size={14} /><input id="trace-to" type="date" className="input w-full pl-9" value={to} onChange={(event) => setTo(event.target.value)} /></div></div><div className="flex items-end"><button className="btn-secondary w-full" onClick={() => updateFilters({ q: q.trim(), tag: tag.trim(), from: localDayStart(from), to: localDayEnd(to) })}>应用高级筛选</button></div></div>}
     </section>
     {error && <div className="panel mb-4"><ErrorState message={error} onRetry={() => void load()} /></div>}
     <section className="panel overflow-hidden">

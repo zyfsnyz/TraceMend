@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { ArrowRight, RefreshCw, Search, ShieldAlert, ShieldCheck } from 'lucide-react';
 import { getTrace, getTraces } from '../api/client';
@@ -22,18 +22,37 @@ export function RisksPage() {
   const [findingsByTrace, setFindingsByTrace] = useState<Record<string, Finding[]>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const requestRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
   const load = useCallback(async () => {
-    setLoading(true); setError('');
+    const requestId = ++requestRef.current;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setLoading(true); setError(''); setFindingsByTrace({});
     try {
-      const list = await getTraces({ risk, q, page, page_size: 20 });
+      const list = await getTraces({ risk, q, page, page_size: 20 }, controller.signal);
+      if (requestId !== requestRef.current || controller.signal.aborted) return;
       setData(list);
-      const details = await Promise.all(list.items.map(async (trace) => [trace.id, (await getTrace(trace.id)).findings] as const));
+      const details = await Promise.all(
+        list.items.map(async (trace) => [
+          trace.id,
+          (await getTrace(trace.id, controller.signal)).findings,
+        ] as const),
+      );
+      if (requestId !== requestRef.current || controller.signal.aborted) return;
       setFindingsByTrace(Object.fromEntries(details));
     }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '未知错误'); }
-    finally { setLoading(false); }
+    catch (reason) {
+      if (requestId !== requestRef.current || controller.signal.aborted) return;
+      setError(reason instanceof Error ? reason.message : '未知错误');
+    }
+    finally { if (requestId === requestRef.current) setLoading(false); }
   }, [risk, q, page]);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load();
+    return () => abortRef.current?.abort();
+  }, [load]);
   const update = (key: string, value: string) => {
     const next = new URLSearchParams(searchParams);
     if (value) next.set(key, value); else next.delete(key);

@@ -10,9 +10,8 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
-
 
 NAMESPACE = uuid.UUID("72f68136-1401-4b29-a1fc-e970996a594b")
 
@@ -22,7 +21,7 @@ def stable_id(label: str) -> str:
 
 
 def moment(offset_ms: int) -> str:
-    base = datetime(2026, 11, 11, 2, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 11, 11, 2, 0, tzinfo=UTC)
     return (base + timedelta(milliseconds=offset_ms)).isoformat().replace("+00:00", "Z")
 
 

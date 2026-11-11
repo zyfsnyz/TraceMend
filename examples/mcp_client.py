@@ -4,7 +4,6 @@ import json
 import os
 import urllib.request
 
-
 upstream = os.environ.get("MCP_UPSTREAM_URL")
 if not upstream:
     raise SystemExit("请先设置 MCP_UPSTREAM_URL，例如 http://127.0.0.1:9000/mcp")

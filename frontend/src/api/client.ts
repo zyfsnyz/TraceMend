@@ -27,7 +27,8 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
         ...options.headers,
       },
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') throw error;
     throw new ApiError('无法连接审计服务，请检查后端是否启动。', 0);
   }
   if (!response.ok) throw await errorFromResponse(response);
@@ -39,17 +40,17 @@ export function getStats(days = 30): Promise<Stats> {
   return apiFetch<Stats>(`/api/stats?days=${days}`);
 }
 
-export function getTraces(filters: TraceFilters = {}): Promise<TraceListResponse> {
+export function getTraces(filters: TraceFilters = {}, signal?: AbortSignal): Promise<TraceListResponse> {
   const params = new URLSearchParams();
   Object.entries(filters).forEach(([key, value]) => {
     if (value !== undefined && value !== null && String(value).trim() !== '') params.set(key, String(value));
   });
   const query = params.toString();
-  return apiFetch<TraceListResponse>(`/api/traces${query ? `?${query}` : ''}`);
+  return apiFetch<TraceListResponse>(`/api/traces${query ? `?${query}` : ''}`, { signal });
 }
 
-export function getTrace(id: string): Promise<TraceDetail> {
-  return apiFetch<TraceDetail>(`/api/traces/${encodeURIComponent(id)}`);
+export function getTrace(id: string, signal?: AbortSignal): Promise<TraceDetail> {
+  return apiFetch<TraceDetail>(`/api/traces/${encodeURIComponent(id)}`, { signal });
 }
 
 export function deleteTrace(id: string): Promise<void> {

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import { ArrowLeft, Bot, ChevronDown, Clock3, Coins, Download, FileText, GitBranch, RefreshCw, ScanSearch, ShieldAlert } from 'lucide-react';
 import { downloadReport, getTrace, llmCheckTrace, reanalyzeTrace } from '../api/client';
 import { ApiError } from '../api/client';
 import type { TraceDetail } from '../api/types';
 import { formatDuration, formatFullTime, formatNumber, shortId } from '../lib/format';
+import { stringifySafe } from '../lib/sensitive';
 import { ErrorState, JsonBlock, Spinner, StatusBadge } from '../components/ui';
 import { TraceDAG } from '../components/TraceDAG';
 import { ReplayBar } from '../components/ReplayBar';
@@ -22,14 +23,33 @@ export function TraceDetailPage() {
   const [error, setError] = useState('');
   const [action, setAction] = useState('');
   const [notice, setNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const requestRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
   const load = useCallback(async (showLoading = true) => {
+    const requestId = ++requestRef.current;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     if (showLoading) setLoading(true);
     setError('');
-    try { setDetail(await getTrace(traceId)); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '未知错误'); }
-    finally { if (showLoading) setLoading(false); }
+    try {
+      const nextDetail = await getTrace(traceId, controller.signal);
+      if (requestId !== requestRef.current || controller.signal.aborted) return;
+      setDetail(nextDetail);
+    }
+    catch (reason) {
+      if (requestId !== requestRef.current || controller.signal.aborted) return;
+      setError(reason instanceof Error ? reason.message : '未知错误');
+    }
+    finally { if (requestId === requestRef.current && showLoading) setLoading(false); }
   }, [traceId]);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    setDetail(null);
+    setSelectedSpanId(null);
+    setNotice(null);
+    void load();
+    return () => abortRef.current?.abort();
+  }, [load]);
   useEffect(() => {
     if (!detail) return;
     if (!selectedSpanId || !detail.spans.some((span) => span.id === selectedSpanId)) {
@@ -74,7 +94,7 @@ export function TraceDetailPage() {
 
   return <div className="mx-auto max-w-[1680px] p-5 md:p-7 xl:p-8">
     <div className="mb-5"><Link to="/traces" className="mb-4 inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-teal-700"><ArrowLeft size={14} />返回审计链路</Link><div className="flex flex-wrap items-start justify-between gap-4"><div className="min-w-0"><div className="flex flex-wrap items-center gap-2.5"><h1 className="page-title break-words">{trace.name}</h1><StatusBadge status={trace.status} />{trace.risk_count > 0 && <a href="#findings" className="badge border-orange-200 bg-orange-50 text-orange-700"><ShieldAlert size={11} />{trace.risk_count} 项风险</a>}</div><div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400"><code>{shortId(trace.id)}</code><span>{trace.source}</span><span>{trace.model || '未指定模型'}</span>{trace.tags?.map((tag) => <span key={tag} className="rounded bg-slate-200/60 px-1.5 py-0.5 text-[10px] text-slate-500">{tag}</span>)}</div></div><div className="flex flex-wrap gap-2"><button className="btn-secondary" disabled={Boolean(action)} onClick={() => void runRules()}><RefreshCw size={14} className={action === 'rules' ? 'animate-spin' : ''} />{action === 'rules' ? '检测中' : '重新检测'}</button><button className="btn-secondary" disabled={Boolean(action)} onClick={() => void runLlm()} title="可选 LLM 检测，未配置时不影响免费规则"><Bot size={14} />{action === 'llm' ? '检测中' : 'LLM 检测'}</button><button className="btn-secondary" disabled={Boolean(action)} onClick={() => void exportReport('md')}><FileText size={14} />{action === 'md' ? '导出中' : 'Markdown'}</button><button className="btn-primary" disabled={Boolean(action)} onClick={() => void exportReport('pdf')}><Download size={14} />{action === 'pdf' ? '导出中' : '导出 PDF'}</button></div></div></div>
-    {error && <div className="panel mb-4"><ErrorState message={error} onRetry={() => void load()} /></div>}{notice && <div className={`mb-4 rounded-lg border px-4 py-3 text-sm ${noticeStyles[notice.tone]}`} role="status">{notice.text}</div>}{trace.error && <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs leading-5 text-red-700"><span className="font-semibold">链路错误：</span>{trace.error}</div>}
+    {error && <div className="panel mb-4"><ErrorState message={error} onRetry={() => void load()} /></div>}{notice && <div className={`mb-4 rounded-lg border px-4 py-3 text-sm ${noticeStyles[notice.tone]}`} role="status">{notice.text}</div>}{trace.error && <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs leading-5 text-red-700"><span className="font-semibold">链路错误：</span><pre className="mt-1 whitespace-pre-wrap break-words font-inherit">{stringifySafe(trace.error)}</pre></div>}
     <section className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">{[
       { label: '开始时间', value: formatFullTime(trace.started_at), icon: Clock3 }, { label: '端到端耗时', value: formatDuration(trace.duration_ms), icon: ScanSearch },
       { label: 'Token 用量', value: `${formatNumber(trace.total_tokens)}（入 ${formatNumber(trace.prompt_tokens)} / 出 ${formatNumber(trace.completion_tokens)}）`, icon: Coins },

@@ -8,7 +8,6 @@ import os
 
 from openai import OpenAI
 
-
 api_key = os.environ.get("OPENAI_API_KEY")
 if not api_key:
     raise SystemExit("请先设置 OPENAI_API_KEY；密钥会先发送给所配置的 AgentTrace，再转发上游。")

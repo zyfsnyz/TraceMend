@@ -46,4 +46,12 @@ describe('SpanInspector 原始数据', () => {
     expect(details).toHaveTextContent('"OPENAI_API_KEY": "[已隐藏]"');
     expect(details).not.toHaveTextContent('raw-openai-key');
   });
+
+  it('默认展开的纯文本与错误区域同样脱敏', () => {
+    render(<SpanInspector span={{ ...span, content: '调用 Bearer embedded-secret', reasoning: 'key sk-secret-value-123456', error: 'Bearer error-secret' }} />);
+    expect(screen.queryByText(/embedded-secret/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/sk-secret-value-123456/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/error-secret/)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/\[已隐藏\]/).length).toBeGreaterThan(0);
+  });
 });

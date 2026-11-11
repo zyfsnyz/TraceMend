@@ -1,12 +1,13 @@
 import { ChevronDown, Clock3, Coins } from 'lucide-react';
 import type { Span } from '../api/types';
 import { formatDuration, formatFullTime, formatNumber } from '../lib/format';
+import { stringifySafe } from '../lib/sensitive';
 import { JsonBlock, StatusBadge } from './ui';
 import { kindLabels } from '../lib/span';
 
 function DataSection({ title, value, text, defaultOpen = false }: { title: string; value?: any; text?: string | null; defaultOpen?: boolean }) {
   if ((value === undefined || value === null) && !text) return null;
-  return <details className="group border-b border-slate-100 last:border-0" open={defaultOpen}><summary className="flex cursor-pointer list-none items-center justify-between py-3 text-xs font-semibold text-slate-700 hover:text-teal-700">{title}<ChevronDown size={13} className="text-slate-400 transition-transform group-open:rotate-180" /></summary><div className="pb-3">{text ? <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700">{text}</pre> : <JsonBlock value={value} />}</div></details>;
+  return <details className="group border-b border-slate-100 last:border-0" open={defaultOpen}><summary className="flex cursor-pointer list-none items-center justify-between py-3 text-xs font-semibold text-slate-700 hover:text-teal-700">{title}<ChevronDown size={13} className="text-slate-400 transition-transform group-open:rotate-180" /></summary><div className="pb-3">{text ? <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-700">{stringifySafe(text)}</pre> : <JsonBlock value={value} />}</div></details>;
 }
 
 export function SpanInspector({ span }: { span: Span | null }) {
