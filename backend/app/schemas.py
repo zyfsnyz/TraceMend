@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class SpanIn(BaseModel):
@@ -56,3 +56,43 @@ class TraceIn(BaseModel):
 class IngestIn(BaseModel):
     trace: TraceIn
     spans: list[SpanIn] = Field(default_factory=list)
+
+
+class CommentCreate(BaseModel):
+    author: str = Field(min_length=1, max_length=80)
+    body: str = Field(min_length=1, max_length=4000)
+    status: Literal["open", "resolved"] = "open"
+
+    @field_validator("author", "body")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("不能为空")
+        return value
+
+
+class TraceCommentIn(CommentCreate):
+    span_id: str | None = None
+
+
+class CommentPatch(BaseModel):
+    author: str | None = Field(default=None, min_length=1, max_length=80)
+    body: str | None = Field(default=None, min_length=1, max_length=4000)
+    status: Literal["open", "resolved"] | None = None
+
+    @field_validator("author", "body")
+    @classmethod
+    def optional_not_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def has_change(self):
+        if self.author is None and self.body is None and self.status is None:
+            raise ValueError("至少提供一个待更新字段")
+        return self

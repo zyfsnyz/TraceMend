@@ -1,15 +1,18 @@
 import math
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import selectinload
 
 from .audit import ingest, load_detail
-from .models import Finding, Trace
+from .llm_check import LLMCheckError, run_llm_check
+from .models import Comment, Finding, Span, Trace
+from .reports import render_markdown, render_pdf
 from .rules import run_rules
-from .schemas import IngestIn
+from .schemas import CommentCreate, CommentPatch, IngestIn, TraceCommentIn
 from .serializers import comment_dict, finding_dict, span_dict, trace_dict
 
 router = APIRouter(prefix="/api")
@@ -111,6 +114,148 @@ def reanalyze_trace(trace_id: str, request: Request):
         finding_count = run_rules(session, trace)
         session.commit()
         return {"trace_id": trace_id, "finding_count": finding_count}
+
+
+@router.post("/traces/{trace_id}/comments", status_code=201)
+def create_trace_comment(trace_id: str, payload: TraceCommentIn, request: Request):
+    with request.app.state.session_factory() as session:
+        trace = load_detail(session, trace_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail="审计链路不存在")
+        if payload.span_id is not None and not any(
+            span.id == payload.span_id for span in trace.spans
+        ):
+            raise HTTPException(status_code=404, detail="该 Span 不属于当前链路")
+        comment = Comment(
+            id=str(uuid4()),
+            trace_id=trace_id,
+            span_id=payload.span_id,
+            author=payload.author,
+            body=payload.body,
+            status=payload.status,
+        )
+        session.add(comment)
+        session.commit()
+        session.refresh(comment)
+        return comment_dict(comment)
+
+
+@router.post("/traces/{trace_id}/spans/{span_id}/comments", status_code=201)
+def create_span_comment(
+    trace_id: str, span_id: str, payload: CommentCreate, request: Request
+):
+    with request.app.state.session_factory() as session:
+        trace = session.get(Trace, trace_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail="审计链路不存在")
+        span = session.get(Span, span_id)
+        if span is None or span.trace_id != trace_id:
+            raise HTTPException(status_code=404, detail="该 Span 不属于当前链路")
+        comment = Comment(
+            id=str(uuid4()),
+            trace_id=trace_id,
+            span_id=span_id,
+            author=payload.author,
+            body=payload.body,
+            status=payload.status,
+        )
+        session.add(comment)
+        session.commit()
+        session.refresh(comment)
+        return comment_dict(comment)
+
+
+@router.patch("/comments/{comment_id}")
+def update_comment(comment_id: str, payload: CommentPatch, request: Request):
+    with request.app.state.session_factory() as session:
+        comment = session.get(Comment, comment_id)
+        if comment is None:
+            raise HTTPException(status_code=404, detail="审计评论不存在")
+        for field in ("author", "body", "status"):
+            value = getattr(payload, field)
+            if value is not None:
+                setattr(comment, field, value)
+        session.commit()
+        session.refresh(comment)
+        return comment_dict(comment)
+
+
+@router.get("/traces/{trace_id}/report.md")
+def export_markdown_report(trace_id: str, request: Request):
+    with request.app.state.session_factory() as session:
+        trace = load_detail(session, trace_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail="审计链路不存在")
+        content = render_markdown(trace)
+    return Response(
+        content=content,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="agenttrace-{trace_id}.md"'},
+    )
+
+
+@router.get("/traces/{trace_id}/report.pdf")
+def export_pdf_report(trace_id: str, request: Request):
+    with request.app.state.session_factory() as session:
+        trace = load_detail(session, trace_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail="审计链路不存在")
+        content = render_pdf(trace)
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="agenttrace-{trace_id}.pdf"'},
+    )
+
+
+@router.post("/traces/{trace_id}/llm-check")
+async def llm_check_trace(trace_id: str, request: Request):
+    settings = request.app.state.settings
+    if not settings.enable_llm_check:
+        raise HTTPException(status_code=409, detail="二阶 LLM 检测未启用")
+    if not settings.check_model_key:
+        raise HTTPException(status_code=409, detail="二阶 LLM 检测未配置模型密钥")
+    with request.app.state.session_factory() as session:
+        trace = load_detail(session, trace_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail="审计链路不存在")
+        try:
+            findings = await run_llm_check(trace, settings)
+        except LLMCheckError as exc:
+            trace.metadata_json = {
+                **(trace.metadata_json or {}),
+                "llm_check": {
+                    "status": "failed",
+                    "model": settings.check_model_name,
+                    "checked_at": datetime.now(UTC).isoformat(),
+                    "error": str(exc),
+                },
+            }
+            session.commit()
+            raise HTTPException(
+                status_code=502, detail="检测模型调用失败，请检查模型地址、密钥和网络"
+            ) from exc
+        for finding in list(trace.findings):
+            if finding.source == "llm":
+                session.delete(finding)
+        session.flush()
+        for item in findings:
+            trace.findings.append(Finding(id=str(uuid4()), trace_id=trace.id, source="llm", **item))
+        trace.metadata_json = {
+            **(trace.metadata_json or {}),
+            "llm_check": {
+                "status": "completed",
+                "model": settings.check_model_name,
+                "checked_at": datetime.now(UTC).isoformat(),
+                "findings": len(findings),
+            },
+        }
+        session.commit()
+        return {
+            "trace_id": trace.id,
+            "finding_count": len(trace.findings),
+            "llm_finding_count": len(findings),
+        }
 
 
 @router.get("/stats")
