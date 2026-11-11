@@ -259,8 +259,7 @@ def run_rules(session: Session, trace: Trace) -> int:
                     in {"available", "success", "found", "exists", "valid", "enabled"}
                 ) or field_name == "status":
                     candidates.append((tool_span, field, expected))
-        if len(candidates) == 1:
-            tool_span, field, expected = candidates[0]
+        for tool_span, field, expected in candidates:
             field_name = field.rsplit(".", 1)[-1].lower()
             success_claim = re.search(r"(?<!不)(?<!未)(?<!没有)(?<!取消)成功", answer)
             failure_claim = re.search(r"(?<!不)(?<!未)(?<!没有)失败", answer)
@@ -302,6 +301,8 @@ def run_rules(session: Session, trace: Trace) -> int:
                     status_conflict = completed_claim and not cancelled_claim
                 if status_conflict:
                     conflict = (tool_span, field, expected)
+            if conflict:
+                break
     if conflict:
         tool_span, field, expected = conflict
         findings.append(

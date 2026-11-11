@@ -226,6 +226,25 @@ async def test_fact_conflict_does_not_cross_wire_multiple_boolean_fields(client)
 
 
 @pytest.mark.asyncio
+async def test_fact_conflict_flags_only_contradicted_field_among_multiple_fields(client):
+    spans = [
+        {
+            "id": "booking-result",
+            "sequence": 0,
+            "kind": "tool_result",
+            "tool_result": {"available": True, "success": False},
+        },
+        {"id": "answer", "sequence": 1, "kind": "llm", "content": "门票可用，但预订成功。"},
+    ]
+
+    _, findings = await ingest_spans(client, spans, "门票可用，但预订成功。")
+
+    assert [finding["rule_code"] for finding in findings] == ["fact_conflict"]
+    assert findings[0]["evidence"]["field"] == "success"
+    assert findings[0]["evidence"]["expected"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool_result", "answer"),
     [
