@@ -8,12 +8,12 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+/backend/uv.lock
 
 # Local data and secrets
 .env
 .env.local
-data/*.db
-data/*.db-*
+**/data/
 artifacts/*.pdf
 artifacts/*.md
 
