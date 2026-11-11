@@ -1,3 +1,4 @@
+import gzip
 import socket
 import threading
 import time
@@ -6,6 +7,9 @@ from types import SimpleNamespace
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.responses import Response
+
+MCP_GZIP_BODY = b'{"jsonrpc":"2.0","id":77,"result":{"content":"gzip ok"}}'
 
 
 @pytest.fixture
@@ -21,6 +25,12 @@ def mcp_upstream():
         )
         method = payload.get("method")
         base = {"jsonrpc": "2.0", "id": payload.get("id")}
+        if method == "gzip":
+            return Response(
+                content=gzip.compress(MCP_GZIP_BODY),
+                media_type="application/json",
+                headers={"Content-Encoding": "gzip"},
+            )
         if method == "initialize":
             return {
                 **base,
@@ -31,9 +41,21 @@ def mcp_upstream():
                 **base,
                 "result": {"tools": [{"name": "weather", "inputSchema": {"type": "object"}}]},
             }
-        if method == "tools/call" and payload.get("params", {}).get("name") == "explode":
-            return {**base, "error": {"code": -32000, "message": "工具爆炸"}}
         if method == "tools/call":
+            params = payload.get("params")
+            tool_name = params.get("name") if isinstance(params, dict) else None
+            if tool_name == "explode":
+                return {**base, "error": {"code": -32000, "message": "工具爆炸"}}
+            if tool_name == "standard-error":
+                return {
+                    **base,
+                    "result": {
+                        "isError": True,
+                        "content": [{"type": "text", "text": "标准工具失败"}],
+                    },
+                }
+            if tool_name == "null-error":
+                return {**base, "error": None, "result": {"content": []}}
             return {
                 **base,
                 "result": {"content": [{"type": "text", "text": "天气晴"}], "source": "local"},

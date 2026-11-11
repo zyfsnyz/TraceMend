@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import socket
 import threading
 import time
@@ -9,6 +10,10 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sse_data import sse_payloads
+
+OPENAI_GZIP_BODY = (
+    b'{"id":"chatcmpl-gzip","choices":[{"message":{"content":"gzip ok"}}],"usage":{}}'
+)
 
 
 @pytest.fixture
@@ -30,6 +35,12 @@ def openai_upstream():
             return Response(content="纯文本结果", media_type="text/plain")
         if payload.get("model") == "empty-model":
             return Response(content=b"", media_type="application/octet-stream")
+        if payload.get("model") == "gzip-model":
+            return Response(
+                content=gzip.compress(OPENAI_GZIP_BODY),
+                media_type="application/json",
+                headers={"Content-Encoding": "gzip"},
+            )
         if payload.get("model") == "denied-html-model":
             return Response(
                 content="<html>Bad Gateway</html>", status_code=502, media_type="text/html"
@@ -51,7 +62,7 @@ def openai_upstream():
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": "明天 25°C",
+                        "content": payload.get("response_content", "明天 25°C"),
                         "reasoning_content": "查过天气",
                         "tool_calls": [
                             {

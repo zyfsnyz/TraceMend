@@ -14,8 +14,20 @@ router = APIRouter()
 
 
 def mcp_request_headers(request: Request) -> dict[str, str]:
-    excluded = HOP_BY_HOP | {"x-mcp-upstream", "x-agenttrace-id"}
+    excluded = HOP_BY_HOP | {"x-mcp-upstream", "x-agenttrace-id", "x-admin-key"}
     return {key: value for key, value in request.headers.items() if key.lower() not in excluded}
+
+
+def mcp_failure(output: object) -> object | None:
+    """Return the JSON-RPC/tool error payload, or None for a successful result."""
+    if not isinstance(output, dict):
+        return None
+    if output.get("error") is not None:
+        return output["error"]
+    result = output.get("result")
+    if isinstance(result, dict) and result.get("isError") is True:
+        return result
+    return None
 
 
 def persist_mcp(
@@ -27,7 +39,10 @@ def persist_mcp(
     started_at: datetime,
 ) -> None:
     ended_at = datetime.now(UTC)
-    failed = upstream_status >= 400 or (isinstance(output, dict) and "error" in output)
+    protocol_error = mcp_failure(output)
+    if upstream_status >= 400:
+        protocol_error = output
+    failed = protocol_error is not None
     with session_factory() as session:
         trace = session.get(Trace, trace_id)
         if trace is None:
@@ -41,6 +56,9 @@ def persist_mcp(
             session.add(trace)
             session.flush()
         next_sequence = max((span.sequence for span in trace.spans), default=-1) + 1
+        previous_failed = trace.status in {"failed", "error"} or any(
+            span.status in {"failed", "error"} or span.error is not None for span in trace.spans
+        )
         protocol = Span(
             id=f"{trace_id}-mcp-{uuid4()}",
             trace_id=trace_id,
@@ -53,12 +71,14 @@ def persist_mcp(
             duration_ms=(ended_at - started_at).total_seconds() * 1000,
             input=payload,
             output=output,
-            error=output.get("error") if failed and isinstance(output, dict) else None,
+            error=protocol_error,
             metadata_json={"upstream_status": upstream_status},
         )
         session.add(protocol)
         if payload.get("method") == "tools/call":
-            params = payload.get("params") or {}
+            params = payload.get("params")
+            if not isinstance(params, dict):
+                params = {}
             session.add(
                 Span(
                     id=f"{trace_id}-tool-{uuid4()}",
@@ -76,11 +96,11 @@ def persist_mcp(
                     tool_name=params.get("name"),
                     tool_arguments=params.get("arguments"),
                     tool_result=output.get("result") if isinstance(output, dict) else None,
-                    error=output.get("error") if failed and isinstance(output, dict) else None,
+                    error=protocol_error,
                     metadata_json={"upstream_status": upstream_status},
                 )
             )
-        trace.status = "failed" if failed else "completed"
+        trace.status = "failed" if failed or previous_failed else "completed"
         trace.input = payload
         trace.output = output
         trace.ended_at = ended_at
@@ -89,6 +109,7 @@ def persist_mcp(
             trace_started = trace_started.replace(tzinfo=UTC)
         trace.duration_ms = (ended_at - trace_started).total_seconds() * 1000
         session.flush()
+        session.expire(trace, ["spans", "findings"])
         run_rules(session, trace)
         session.commit()
 
@@ -133,8 +154,8 @@ async def mcp_proxy(request: Request, path: str = ""):
         )
     try:
         output = upstream.json()
-    except json.JSONDecodeError:
-        output = {"content": upstream.text}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        output = {"content": upstream.content.decode(errors="replace")}
     persist_mcp(
         request.app.state.session_factory,
         trace_id,
@@ -146,6 +167,6 @@ async def mcp_proxy(request: Request, path: str = ""):
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
-        headers=forward_response_headers(upstream.headers, trace_id),
+        headers=forward_response_headers(upstream.headers, trace_id, decoded=True),
         media_type=upstream.headers.get("content-type"),
     )

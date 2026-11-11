@@ -60,10 +60,17 @@ def apply_trace(trace: Trace, data: TraceIn) -> None:
     trace.duration_ms = duration_ms(data.started_at, data.ended_at, data.duration_ms)
 
 
+def apply_span(span: Span, data: SpanIn) -> None:
+    for field in SPAN_FIELDS:
+        setattr(span, field, getattr(data, field))
+    span.metadata_json = data.metadata
+    span.duration_ms = duration_ms(data.started_at, data.ended_at, data.duration_ms)
+
+
 def make_span(data: SpanIn, trace_id: str) -> Span:
-    values = {field: getattr(data, field) for field in SPAN_FIELDS}
-    values["duration_ms"] = duration_ms(data.started_at, data.ended_at, data.duration_ms)
-    return Span(id=data.id, trace_id=trace_id, metadata_json=data.metadata, **values)
+    span = Span(id=data.id, trace_id=trace_id)
+    apply_span(span, data)
+    return span
 
 
 def ingest(session: Session, payload: IngestIn) -> tuple[Trace, int]:
@@ -72,13 +79,17 @@ def ingest(session: Session, payload: IngestIn) -> tuple[Trace, int]:
         trace = Trace(id=payload.trace.id)
         session.add(trace)
     apply_trace(trace, payload.trace)
-    if trace.spans:
-        for span in list(trace.spans):
-            session.delete(span)
-        session.flush()
-    trace.spans = [
-        make_span(span, trace.id) for span in sorted(payload.spans, key=lambda item: item.sequence)
-    ]
+    existing = {span.id: span for span in trace.spans}
+    incoming_ids = {span.id for span in payload.spans}
+    for span_id, span in existing.items():
+        if span_id not in incoming_ids:
+            trace.spans.remove(span)
+    for data in sorted(payload.spans, key=lambda item: item.sequence):
+        span = existing.get(data.id)
+        if span is None:
+            trace.spans.append(make_span(data, trace.id))
+        else:
+            apply_span(span, data)
     session.flush()
     finding_count = run_rules(session, trace)
     session.commit()

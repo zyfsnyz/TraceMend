@@ -101,3 +101,89 @@ async def test_mcp_without_upstream_returns_clear_error(client):
     assert response.status_code == 400
     assert "X-MCP-Upstream" in response.json()["detail"]
     assert "DEFAULT_MCP_UPSTREAM" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_gzip_response_removes_stale_encoding_and_preserves_decoded_body(
+    client, mcp_upstream
+):
+    from mcp_upstream_fixture import MCP_GZIP_BODY
+
+    response = await client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 77, "method": "gzip", "params": {}},
+        headers={"X-MCP-Upstream": mcp_upstream.url, "X-AgentTrace-Id": "mcp-gzip"},
+    )
+
+    assert response.status_code == 200
+    assert "content-encoding" not in response.headers
+    assert response.content == MCP_GZIP_BODY
+    assert response.json()["result"] == {"content": "gzip ok"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [None, [], "bad", 1])
+async def test_mcp_malformed_params_do_not_change_upstream_response(
+    client, mcp_upstream, params
+):
+    response = await client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 78, "method": "tools/call", "params": params},
+        headers={
+            "X-MCP-Upstream": mcp_upstream.url,
+            "X-AgentTrace-Id": "mcp-audit-isolation",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["content"][0]["text"] == "天气晴"
+    assert (await client.get("/api/traces/mcp-audit-isolation")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_mcp_standard_tool_error_saves_result_and_creates_finding(client, mcp_upstream):
+    response = await client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 80,
+            "method": "tools/call",
+            "params": {"name": "standard-error", "arguments": {}},
+        },
+        headers={"X-MCP-Upstream": mcp_upstream.url, "X-AgentTrace-Id": "mcp-standard-error"},
+    )
+
+    assert response.status_code == 200
+    detail = (await client.get("/api/traces/mcp-standard-error")).json()
+    assert detail["trace"]["status"] == "failed"
+    tool = next(span for span in detail["spans"] if span["kind"] == "tool")
+    assert tool["status"] == "error"
+    assert tool["error"] == response.json()["result"]
+    assert tool["error"]["isError"] is True
+    tool_errors = [
+        finding for finding in detail["findings"] if finding["rule_code"] == "tool_error"
+    ]
+    assert len(tool_errors) == 1
+    assert tool_errors[0]["span_id"] == tool["id"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_null_top_level_error_is_not_a_failure(client, mcp_upstream):
+    response = await client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 81,
+            "method": "tools/call",
+            "params": {"name": "null-error", "arguments": {}},
+        },
+        headers={"X-MCP-Upstream": mcp_upstream.url, "X-AgentTrace-Id": "mcp-null-error"},
+    )
+
+    assert response.status_code == 200
+    detail = (await client.get("/api/traces/mcp-null-error")).json()
+    assert detail["trace"]["status"] == "completed"
+    tool = next(span for span in detail["spans"] if span["kind"] == "tool")
+    assert tool["status"] == "completed"
+    assert tool["error"] is None
+    assert not [finding for finding in detail["findings"] if finding["rule_code"] == "tool_error"]

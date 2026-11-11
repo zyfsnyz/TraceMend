@@ -363,3 +363,45 @@ async def test_reanalyze_replaces_only_rule_findings(client, tmp_path):
     assert len(findings) == 2
     assert {finding["source"] for finding in findings} == {"rule", "llm"}
     assert sum(finding["id"] == "llm-review" for finding in findings) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [True, False])
+async def test_boolean_tool_status_is_not_processed_as_a_status_string(client, status):
+    _, findings = await ingest_spans(
+        client,
+        [
+            {
+                "id": "boolean-status",
+                "sequence": 0,
+                "kind": "tool_result",
+                "tool_result": {"status": status},
+            },
+            {"id": "answer", "sequence": 1, "kind": "llm", "content": "操作成功。"},
+        ],
+        "操作成功。",
+    )
+
+    assert findings == []
+    assert len((await client.get("/api/traces/rules")).json()["spans"]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required", [None, "city", 7, ["city", 7, None], {"field": "city"}])
+async def test_only_string_list_tool_schema_required_is_enforced(client, required):
+    _, findings = await ingest_spans(
+        client,
+        [
+            {
+                "id": "schema-call",
+                "sequence": 0,
+                "kind": "tool",
+                "tool_name": "weather",
+                "tool_arguments": {},
+                "metadata": {"tool_schema": {"required": required}},
+            }
+        ],
+    )
+
+    assert findings == []
+    assert len((await client.get("/api/traces/rules")).json()["spans"]) == 1

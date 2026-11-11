@@ -74,8 +74,12 @@ class Span(Base):
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
 
     trace: Mapped[Trace] = relationship(back_populates="spans")
-    findings: Mapped[list["Finding"]] = relationship(back_populates="span")
-    comments: Mapped[list["Comment"]] = relationship(back_populates="span")
+    findings: Mapped[list["Finding"]] = relationship(
+        back_populates="span", passive_deletes=True
+    )
+    comments: Mapped[list["Comment"]] = relationship(
+        back_populates="span", passive_deletes=True
+    )
 
 
 class Finding(Base):

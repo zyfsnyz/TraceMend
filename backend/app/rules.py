@@ -141,6 +141,10 @@ def run_rules(session: Session, trace: Trace) -> int:
                     parse_error = str(exc)
             schema = (span.metadata_json or {}).get("tool_schema") or {}
             required = schema.get("required", []) if isinstance(schema, dict) else []
+            if not isinstance(required, list) or not all(
+                isinstance(field, str) for field in required
+            ):
+                required = []
             missing = [
                 field
                 for field in required
@@ -257,7 +261,7 @@ def run_rules(session: Session, trace: Trace) -> int:
                     isinstance(expected, bool)
                     and field_name
                     in {"available", "success", "found", "exists", "valid", "enabled"}
-                ) or field_name == "status":
+                ) or (field_name == "status" and not isinstance(expected, bool)):
                     candidates.append((tool_span, field, expected))
         for tool_span, field, expected in candidates:
             field_name = field.rsplit(".", 1)[-1].lower()

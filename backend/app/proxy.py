@@ -6,8 +6,10 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .audit import ingest
-from .schemas import IngestIn, SpanIn, TraceIn
+from .audit import make_span
+from .models import Trace
+from .rules import run_rules
+from .schemas import SpanIn
 
 router = APIRouter()
 HOP_BY_HOP = {
@@ -39,8 +41,11 @@ async def request_json_object(request: Request) -> dict:
     return payload
 
 
-def forward_response_headers(headers: httpx.Headers, trace_id: str) -> dict[str, str]:
-    result = {key: value for key, value in headers.items() if key.lower() not in HOP_BY_HOP}
+def forward_response_headers(
+    headers: httpx.Headers, trace_id: str, *, decoded: bool = False
+) -> dict[str, str]:
+    excluded = HOP_BY_HOP | ({"content-encoding"} if decoded else set())
+    result = {key: value for key, value in headers.items() if key.lower() not in excluded}
     result["X-AgentTrace-Id"] = trace_id
     return result
 
@@ -64,21 +69,33 @@ def persist_openai_trace(
     ended_at: datetime,
     error=None,
 ) -> None:
+    invocation_id = uuid4().hex
+    span_prefix = f"{trace_id}-{invocation_id}"
     usage = output.get("usage", {}) if isinstance(output, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
     message = {}
     if isinstance(output, dict):
         try:
-            message = output["choices"][0]["message"]
+            candidate = output["choices"][0]["message"]
+            message = candidate if isinstance(candidate, dict) else {}
         except (KeyError, IndexError, TypeError):
             message = {}
     spans = []
     sequence = 0
-    for item in payload.get("messages", []):
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list):
+        messages = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
         role = item.get("role", "user")
+        if not isinstance(role, str):
+            role = "user"
         kind = {"user": "user", "system": "system", "tool": "tool_result"}.get(role, "user")
         spans.append(
             SpanIn(
-                id=f"{trace_id}-message-{sequence}",
+                id=f"{span_prefix}-message-{sequence}",
                 sequence=sequence,
                 kind=kind,
                 name=f"{role} 消息",
@@ -89,7 +106,7 @@ def persist_openai_trace(
             )
         )
         sequence += 1
-    llm_id = f"{trace_id}-llm"
+    llm_id = f"{span_prefix}-llm"
     spans.append(
         SpanIn(
             id=llm_id,
@@ -106,6 +123,7 @@ def persist_openai_trace(
             total_tokens=usage.get("total_tokens", 0),
             error=error,
             metadata={
+                "invocation_id": invocation_id,
                 "upstream_status": (
                     200
                     if status == "completed"
@@ -117,16 +135,25 @@ def persist_openai_trace(
         )
     )
     sequence += 1
-    schemas = {
-        tool.get("function", {}).get("name"): tool.get("function", {}).get("parameters", {})
-        for tool in payload.get("tools", [])
-    }
-    for call in message.get("tool_calls", []):
-        function = call.get("function", {})
+    schemas = {}
+    tools = payload.get("tools", [])
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict) or not isinstance(tool.get("function"), dict):
+                continue
+            function = tool["function"]
+            schemas[function.get("name")] = function.get("parameters", {})
+    tool_calls = message.get("tool_calls", [])
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+    for call in tool_calls:
+        if not isinstance(call, dict) or not isinstance(call.get("function"), dict):
+            continue
+        function = call["function"]
         arguments, _ = parse_arguments(function.get("arguments"))
         spans.append(
             SpanIn(
-                id=f"{trace_id}-tool-{sequence}",
+                id=f"{span_prefix}-tool-{sequence}",
                 parent_span_id=llm_id,
                 sequence=sequence,
                 kind="tool",
@@ -137,24 +164,53 @@ def persist_openai_trace(
             )
         )
         sequence += 1
-    trace = TraceIn(
-        id=trace_id,
-        name="OpenAI 对话代理",
-        source="openai-proxy",
-        status=status,
-        model=payload.get("model"),
-        input=payload,
-        output=output,
-        started_at=started_at,
-        ended_at=ended_at,
-        duration_ms=(ended_at - started_at).total_seconds() * 1000,
-        prompt_tokens=usage.get("prompt_tokens", 0),
-        completion_tokens=usage.get("completion_tokens", 0),
-        total_tokens=usage.get("total_tokens", 0),
-        error=error,
-    )
     with session_factory() as session:
-        ingest(session, IngestIn(trace=trace, spans=spans))
+        trace = session.get(Trace, trace_id)
+        if trace is None:
+            trace = Trace(
+                id=trace_id,
+                name="OpenAI 对话代理",
+                source="openai-proxy",
+                status="completed",
+                started_at=started_at,
+            )
+            session.add(trace)
+            session.flush()
+
+        previous_failed = trace.status in {"failed", "error"} or any(
+            span.status in {"failed", "error"} or span.error is not None for span in trace.spans
+        )
+        next_sequence = max((span.sequence for span in trace.spans), default=-1) + 1
+        for data in sorted(spans, key=lambda item: item.sequence):
+            span = make_span(data, trace.id)
+            span.sequence += next_sequence
+            trace.spans.append(span)
+
+        trace.name = "OpenAI 对话代理"
+        trace.source = "openai-proxy"
+        trace.status = "failed" if previous_failed or status == "failed" else status
+        trace.model = payload.get("model")
+        trace.input = payload
+        trace.output = output
+        trace.prompt_tokens = (trace.prompt_tokens or 0) + usage.get("prompt_tokens", 0)
+        trace.completion_tokens = (trace.completion_tokens or 0) + usage.get(
+            "completion_tokens", 0
+        )
+        trace.total_tokens = (trace.total_tokens or 0) + usage.get("total_tokens", 0)
+        trace.error = error if error is not None else trace.error
+
+        trace_started = trace.started_at or started_at
+        if trace_started.tzinfo is None:
+            trace_started = trace_started.replace(tzinfo=UTC)
+        trace.started_at = min(trace_started, started_at)
+        previous_ended = trace.ended_at
+        if previous_ended is not None and previous_ended.tzinfo is None:
+            previous_ended = previous_ended.replace(tzinfo=UTC)
+        trace.ended_at = max(previous_ended, ended_at) if previous_ended else ended_at
+        trace.duration_ms = (trace.ended_at - trace.started_at).total_seconds() * 1000
+        session.flush()
+        run_rules(session, trace)
+        session.commit()
 
 
 class SSEAccumulator:
@@ -197,26 +253,48 @@ class SSEAccumulator:
             event = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
+        if not isinstance(event, dict):
+            return
         if isinstance(event.get("usage"), dict):
             self.usage = event["usage"]
-        for choice in event.get("choices", []):
-            if choice.get("index", 0) != 0:
+        choices = event.get("choices", [])
+        if not isinstance(choices, list):
+            return
+        for choice in choices:
+            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
                 continue
-            delta = choice.get("delta") or {}
-            self.content += delta.get("content") or ""
-            self.reasoning += delta.get("reasoning_content") or delta.get("reasoning") or ""
-            for call in delta.get("tool_calls") or []:
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if isinstance(content, str):
+                self.content += content
+            if isinstance(reasoning, str):
+                self.reasoning += reasoning
+            calls = delta.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
                 index = call.get("index", 0)
+                if not isinstance(index, int) or isinstance(index, bool):
+                    continue
                 current = self.tool_calls.setdefault(
                     index,
                     {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
                 )
-                current["id"] = call.get("id") or current["id"]
-                current["type"] = call.get("type") or current["type"]
-                function = call.get("function") or {}
-                if function.get("name"):
+                if isinstance(call.get("id"), str):
+                    current["id"] = call["id"] or current["id"]
+                if isinstance(call.get("type"), str):
+                    current["type"] = call["type"] or current["type"]
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                if isinstance(function.get("name"), str):
                     current["function"]["name"] += function["name"]
-                if function.get("arguments"):
+                if isinstance(function.get("arguments"), str):
                     current["function"]["arguments"] += function["arguments"]
 
     def output(self, payload: dict) -> dict:
@@ -337,7 +415,7 @@ async def chat_completions(request: Request):
                 datetime.now(UTC),
                 {"status_code": upstream.status_code, "body": output},
             )
-            headers = forward_response_headers(upstream.headers, trace_id)
+            headers = forward_response_headers(upstream.headers, trace_id, decoded=True)
             media_type = upstream.headers.get("content-type")
             await upstream.aclose()
             await client.aclose()
@@ -389,6 +467,6 @@ async def chat_completions(request: Request):
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
-        headers=forward_response_headers(upstream.headers, trace_id),
+        headers=forward_response_headers(upstream.headers, trace_id, decoded=True),
         media_type=upstream.headers.get("content-type"),
     )

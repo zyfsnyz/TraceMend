@@ -215,3 +215,53 @@ async def test_openai_network_failure_returns_502_after_persisting_trace(client,
     assert detail.json()["trace"]["status"] == "failed"
     assert detail.json()["trace"]["error"]["type"] == "ConnectError"
     assert "must-not-leak" not in detail.text
+
+
+@pytest.mark.asyncio
+async def test_openai_gzip_response_removes_stale_encoding_and_preserves_decoded_body(
+    client, openai_upstream
+):
+    from upstream_fixtures import OPENAI_GZIP_BODY
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "gzip-model", "messages": []},
+        headers={
+            "X-Upstream-Base": openai_upstream.base_url,
+            "X-AgentTrace-Id": "proxy-gzip",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "content-encoding" not in response.headers
+    assert response.content == OPENAI_GZIP_BODY
+    assert response.json()["choices"][0]["message"]["content"] == "gzip ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload_patch",
+    [
+        {"messages": None},
+        {"messages": {}},
+        {"messages": [None, 1, "bad"]},
+        {"messages": [], "tools": None},
+        {"messages": [], "tools": [None, 1, {"function": None}]},
+    ],
+)
+async def test_openai_malformed_audit_payload_does_not_change_upstream_response(
+    client, openai_upstream, payload_patch
+):
+    payload = {"model": "plain-model", "messages": []} | payload_patch
+    response = await client.post(
+        "/v1/chat/completions",
+        json=payload,
+        headers={
+            "X-Upstream-Base": openai_upstream.base_url,
+            "X-AgentTrace-Id": "proxy-audit-isolation",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.content == "纯文本结果".encode()
+    assert (await client.get("/api/traces/proxy-audit-isolation")).status_code == 200
