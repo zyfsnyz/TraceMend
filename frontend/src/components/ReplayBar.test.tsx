@@ -19,4 +19,13 @@ describe('回放控制交互', () => {
     expect(screen.getByText('1 / 3')).toBeInTheDocument();
     expect(onActiveChange).toHaveBeenLastCalledWith('s1');
   });
+
+  it('外部从 DAG 或时间线选择节点时同步回放进度', () => {
+    const onActiveChange = vi.fn();
+    const { rerender } = render(<ReplayBar spans={spans} activeSpanId="s1" onActiveChange={onActiveChange} />);
+    expect(screen.getByText('1 / 3')).toBeInTheDocument();
+    rerender(<ReplayBar spans={spans} activeSpanId="s3" onActiveChange={onActiveChange} />);
+    expect(screen.getByText('3 / 3')).toBeInTheDocument();
+    expect(screen.getByText('步骤 3')).toBeInTheDocument();
+  });
 });

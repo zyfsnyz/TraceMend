@@ -5,10 +5,11 @@ import { initialReplayState, transitionReplay, type ReplayAction, type ReplaySta
 
 interface ReplayBarProps {
   spans: Span[];
+  activeSpanId?: string | null;
   onActiveChange: (spanId: string | null) => void;
 }
 
-export function ReplayBar({ spans, onActiveChange }: ReplayBarProps) {
+export function ReplayBar({ spans, activeSpanId, onActiveChange }: ReplayBarProps) {
   const ordered = useMemo(() => [...spans].sort((a, b) => a.sequence - b.sequence), [spans]);
   const [state, setState] = useState<ReplayState>(initialReplayState);
   const current = ordered[state.index];
@@ -16,6 +17,12 @@ export function ReplayBar({ spans, onActiveChange }: ReplayBarProps) {
 
   useEffect(() => onActiveChange(currentId), [currentId, onActiveChange]);
   useEffect(() => setState(initialReplayState), [spans]);
+  useEffect(() => {
+    if (!activeSpanId) return;
+    const index = ordered.findIndex((span) => span.id === activeSpanId);
+    if (index < 0) return;
+    setState((value) => value.index === index ? value : { index, playing: false });
+  }, [activeSpanId, ordered]);
   useEffect(() => {
     if (!state.playing) return;
     const timer = window.setInterval(() => setState((value) => transitionReplay(value, { type: 'tick' }, ordered.length)), 1200);

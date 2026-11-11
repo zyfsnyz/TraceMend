@@ -76,6 +76,7 @@ async def test_pdf_report_is_real_pdf(client):
     assert response.headers["content-type"].startswith("application/pdf")
     assert response.content.startswith(b"%PDF")
     assert len(response.content) > 1000
+    assert b"/FontFile2" in response.content
 
 
 @pytest.mark.asyncio

@@ -109,6 +109,7 @@ python scripts/seed_demo.py
 | `CHECK_MODEL_BASE` | `https://api.openai.com/v1` | 可选检测模型的 OpenAI 兼容 base URL |
 | `CHECK_MODEL_KEY` | 空 | 可选检测模型密钥 |
 | `CHECK_MODEL_NAME` | `gpt-4o-mini` | 可选检测模型名称 |
+| `CHECK_MODEL_TIMEOUT` | `60` | 可选检测模型请求超时秒数 |
 | `ADMIN_KEY` | 空 | 设置后，除健康检查外的 `/api/*` 需要 `X-Admin-Key` |
 
 `.env` 被 Git 忽略，`.env.example` 不含真实密钥。
@@ -295,6 +296,10 @@ python scripts/e2e_smoke.py --cleanup
 - 更多报告模板和外部工单系统集成。
 
 路线图是后续方向，不表示这些能力已经完成。
+
+## 字体许可
+
+PDF 报告内嵌 Noto Sans SC 字体子集，字体文件位于 `backend/assets/fonts/`，使用 SIL Open Font License 1.1；许可全文见同目录 `OFL.txt`。容器构建会一并复制该字体目录，因此 Linux 环境无需安装额外中文字体。
 
 ## License
 

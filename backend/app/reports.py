@@ -2,6 +2,7 @@
 import json
 from collections import Counter
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
@@ -12,6 +13,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from .models import Span, Trace
@@ -194,18 +196,28 @@ def render_markdown(trace: Trace) -> str:
     return "\n".join(lines) + "\n"
 
 
-_FONT = "STSong-Light"
+_FONT = "AgentTraceCN"
+_FONT_PATH = Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSansSC-VF.ttf"
+
+
+def _registered_font() -> str:
+    if _FONT not in pdfmetrics.getRegisteredFontNames():
+        if _FONT_PATH.exists():
+            pdfmetrics.registerFont(TTFont(_FONT, str(_FONT_PATH)))
+        else:
+            pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+            return "STSong-Light"
+    return _FONT
 
 
 def _pdf_styles():
-    if _FONT not in pdfmetrics.getRegisteredFontNames():
-        pdfmetrics.registerFont(UnicodeCIDFont(_FONT))
+    font_name = _registered_font()
     base = getSampleStyleSheet()
     return {
         "title": ParagraphStyle(
             "AgentTraceCnTitle",
             parent=base["Title"],
-            fontName=_FONT,
+            fontName=font_name,
             fontSize=20,
             leading=27,
             textColor=colors.HexColor("#0f172a"),
@@ -213,7 +225,7 @@ def _pdf_styles():
         "h2": ParagraphStyle(
             "AgentTraceCnH2",
             parent=base["Heading2"],
-            fontName=_FONT,
+            fontName=font_name,
             fontSize=13,
             leading=19,
             spaceBefore=10,
@@ -223,13 +235,13 @@ def _pdf_styles():
         "body": ParagraphStyle(
             "AgentTraceCnBody",
             parent=base["BodyText"],
-            fontName=_FONT,
+            fontName=font_name,
             fontSize=9,
             leading=14,
             alignment=TA_LEFT,
         ),
         "small": ParagraphStyle(
-            "AgentTraceCnSmall", parent=base["BodyText"], fontName=_FONT, fontSize=7.5, leading=10.5
+            "AgentTraceCnSmall", parent=base["BodyText"], fontName=font_name, fontSize=7.5, leading=10.5
         ),
     }
 
