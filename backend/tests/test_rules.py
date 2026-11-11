@@ -209,6 +209,82 @@ async def test_fact_conflict_requires_explicit_boolean_contradiction(client):
 
 
 @pytest.mark.asyncio
+async def test_fact_conflict_does_not_cross_wire_multiple_boolean_fields(client):
+    spans = [
+        {
+            "id": "booking-result",
+            "sequence": 0,
+            "kind": "tool_result",
+            "tool_result": {"available": True, "success": False},
+        },
+        {"id": "answer", "sequence": 1, "kind": "llm", "content": "门票可用，但预订失败。"},
+    ]
+
+    _, findings = await ingest_spans(client, spans, "门票可用，但预订失败。")
+
+    assert findings == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_result", "answer"),
+    [
+        ({"success": True}, "操作失败。"),
+        ({"success": False}, "操作成功。"),
+        ({"status": "failed"}, "操作成功。"),
+        ({"status": "error"}, "操作已成功。"),
+        ({"status": "success"}, "操作失败。"),
+        ({"status": "completed"}, "操作已失败。"),
+        ({"status": "succeeded"}, "操作失败。"),
+    ],
+)
+async def test_fact_conflict_matches_single_operation_outcome(client, tool_result, answer):
+    spans = [
+        {
+            "id": "operation-result",
+            "sequence": 0,
+            "kind": "tool_result",
+            "tool_result": tool_result,
+        },
+        {"id": "answer", "sequence": 1, "kind": "llm", "content": answer},
+    ]
+
+    _, findings = await ingest_spans(client, spans, answer)
+
+    assert [finding["rule_code"] for finding in findings] == ["fact_conflict"]
+    assert findings[0]["evidence"]["expected"] == next(iter(tool_result.values()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_result", "answer"),
+    [
+        ({"success": True}, "操作未失败。"),
+        ({"success": True}, "操作没有失败。"),
+        ({"success": True}, "操作成功，但操作失败。"),
+        ({"status": "success"}, "操作未失败。"),
+        ({"status": "completed"}, "操作没有失败。"),
+    ],
+)
+async def test_fact_conflict_ignores_negated_failure_and_mixed_claims(
+    client, tool_result, answer
+):
+    spans = [
+        {
+            "id": "operation-result",
+            "sequence": 0,
+            "kind": "tool_result",
+            "tool_result": tool_result,
+        },
+        {"id": "answer", "sequence": 1, "kind": "llm", "content": answer},
+    ]
+
+    _, findings = await ingest_spans(client, spans, answer)
+
+    assert findings == []
+
+
+@pytest.mark.asyncio
 async def test_fact_conflict_recognizes_explicit_status_values(client):
     spans = [
         {

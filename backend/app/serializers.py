@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from .models import Comment, Finding, Span, Trace
@@ -7,7 +7,9 @@ from .models import Comment, Finding, Span, Trace
 def iso(value: datetime | None) -> str | None:
     if value is None:
         return None
-    return value.isoformat().replace("+00:00", "Z")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def trace_dict(

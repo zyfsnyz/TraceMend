@@ -63,6 +63,76 @@ async def test_openai_nonstream_real_upstream_persists_trace_and_forwards_auth(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "status_code", "content", "content_type", "trace_status"),
+    [
+        (
+            "html-model",
+            200,
+            "<html><body>上游维护中</body></html>",
+            "text/html; charset=utf-8",
+            "completed",
+        ),
+        ("plain-model", 200, "纯文本结果", "text/plain; charset=utf-8", "completed"),
+        ("empty-model", 200, "", "application/octet-stream", "completed"),
+        (
+            "denied-html-model",
+            502,
+            "<html>Bad Gateway</html>",
+            "text/html; charset=utf-8",
+            "failed",
+        ),
+    ],
+)
+async def test_openai_nonstream_non_json_is_transparent_and_persisted(
+    client, openai_upstream, model, status_code, content, content_type, trace_status
+):
+    trace_id = f"proxy-{model}"
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": model, "messages": []},
+        headers={
+            "X-Upstream-Base": openai_upstream.base_url,
+            "X-AgentTrace-Id": trace_id,
+        },
+    )
+
+    assert response.status_code == status_code
+    assert response.content == content.encode()
+    assert response.headers["content-type"] == content_type
+
+    detail = await client.get(f"/api/traces/{trace_id}")
+    assert detail.status_code == 200
+    trace = detail.json()["trace"]
+    assert trace["status"] == trace_status
+    assert trace["output"] == {"content": content}
+    if status_code >= 400:
+        assert trace["error"]["status_code"] == status_code
+        assert trace["error"]["body"] == {"content": content}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "detail"),
+    [
+        (b'{"model":', "请求体不是有效的 JSON"),
+        (b"", "请求体不是有效的 JSON"),
+        (b"[]", "请求体必须是 JSON 对象"),
+        (b'"text"', "请求体必须是 JSON 对象"),
+        (b"1", "请求体必须是 JSON 对象"),
+        (b"null", "请求体必须是 JSON 对象"),
+    ],
+)
+async def test_openai_rejects_invalid_json_body_with_chinese_422(client, body, detail):
+    response = await client.post(
+        "/v1/chat/completions", content=body, headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": detail}
+
+
+@pytest.mark.asyncio
 async def test_openai_sse_real_upstream_preserves_bytes_and_aggregates_tool_calls(
     client, openai_upstream
 ):

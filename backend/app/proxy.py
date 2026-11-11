@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .audit import ingest
@@ -27,6 +27,16 @@ HOP_BY_HOP = {
 def forward_request_headers(request: Request) -> dict[str, str]:
     excluded = HOP_BY_HOP | {"x-upstream-base", "x-agenttrace-id"}
     return {key: value for key, value in request.headers.items() if key.lower() not in excluded}
+
+
+async def request_json_object(request: Request) -> dict:
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="请求体不是有效的 JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="请求体必须是 JSON 对象")
+    return payload
 
 
 def forward_response_headers(headers: httpx.Headers, trace_id: str) -> dict[str, str]:
@@ -289,7 +299,7 @@ def network_failure_response(
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    payload = await request.json()
+    payload = await request_json_object(request)
     trace_id = request.headers.get("X-AgentTrace-Id", str(uuid4()))
     upstream_base = request.headers.get(
         "X-Upstream-Base", request.app.state.settings.default_upstream_base
@@ -361,7 +371,10 @@ async def chat_completions(request: Request):
         return network_failure_response(
             request.app.state.session_factory, trace_id, payload, started_at, exc
         )
-    output = upstream.json()
+    try:
+        output = upstream.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        output = {"content": upstream.content.decode(errors="replace")}
     ended_at = datetime.now(UTC)
     persist_openai_trace(
         request.app.state.session_factory,

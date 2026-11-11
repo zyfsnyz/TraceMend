@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sse_data import sse_payloads
 
 
@@ -22,6 +22,18 @@ def openai_upstream():
         requests.append({"payload": payload, "headers": dict(request.headers)})
         if payload.get("model") == "denied-model":
             return JSONResponse(status_code=429, content={"error": {"message": "上游限流"}})
+        if payload.get("model") == "html-model":
+            return Response(
+                content="<html><body>上游维护中</body></html>", media_type="text/html"
+            )
+        if payload.get("model") == "plain-model":
+            return Response(content="纯文本结果", media_type="text/plain")
+        if payload.get("model") == "empty-model":
+            return Response(content=b"", media_type="application/octet-stream")
+        if payload.get("model") == "denied-html-model":
+            return Response(
+                content="<html>Bad Gateway</html>", status_code=502, media_type="text/html"
+            )
         if payload.get("stream"):
 
             async def generate():

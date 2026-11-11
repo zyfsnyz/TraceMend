@@ -74,6 +74,27 @@ async def test_mcp_json_rpc_error_marks_tool_failed(client, mcp_upstream):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "detail"),
+    [
+        (b'{"jsonrpc":', "请求体不是有效的 JSON"),
+        (b"", "请求体不是有效的 JSON"),
+        (b"[]", "请求体必须是 JSON 对象"),
+        (b'"text"', "请求体必须是 JSON 对象"),
+        (b"1", "请求体必须是 JSON 对象"),
+        (b"null", "请求体必须是 JSON 对象"),
+    ],
+)
+async def test_mcp_validates_json_before_upstream_configuration(client, body, detail):
+    response = await client.post(
+        "/mcp", content=body, headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": detail}
+
+
+@pytest.mark.asyncio
 async def test_mcp_without_upstream_returns_clear_error(client):
     response = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 

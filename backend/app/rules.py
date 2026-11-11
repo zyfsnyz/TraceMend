@@ -245,45 +245,63 @@ def run_rules(session: Session, trace: Trace) -> int:
                 },
             )
         )
-    negative_claim = re.search(r"不可用|不存在|未找到|失败|无效", answer)
-    positive_claim = re.search(r"(?<!不)可用|(?<!不)存在|已找到|成功|有效", answer)
     conflict = None
     if answer and not re.search(r"不是不|并非不", answer):
+        candidates = []
         for tool_span in trace.spans:
             if tool_span.kind not in {"tool", "tool_result"}:
                 continue
             for field, expected in explicit_fields(tool_span.tool_result):
                 field_name = field.rsplit(".", 1)[-1].lower()
-                if not isinstance(expected, bool) or field_name not in {
-                    "available",
-                    "success",
-                    "found",
-                    "exists",
-                    "valid",
-                    "enabled",
-                }:
-                    status_value = str(expected).lower()
-                    status_conflict = field_name == "status" and (
-                        (
-                            status_value in {"cancelled", "canceled", "已取消"}
-                            and re.search(r"已完成|成功", answer)
-                        )
-                        or (
-                            status_value in {"completed", "success", "succeeded", "已完成"}
-                            and re.search(r"已取消|取消成功", answer)
-                        )
-                    )
-                    if not status_conflict:
-                        continue
                 if (
-                    not isinstance(expected, bool)
-                    or (expected and negative_claim)
-                    or (not expected and positive_claim and not negative_claim)
+                    isinstance(expected, bool)
+                    and field_name
+                    in {"available", "success", "found", "exists", "valid", "enabled"}
+                ) or field_name == "status":
+                    candidates.append((tool_span, field, expected))
+        if len(candidates) == 1:
+            tool_span, field, expected = candidates[0]
+            field_name = field.rsplit(".", 1)[-1].lower()
+            success_claim = re.search(r"(?<!不)(?<!未)(?<!没有)(?<!取消)成功", answer)
+            failure_claim = re.search(r"(?<!不)(?<!未)(?<!没有)失败", answer)
+            if isinstance(expected, bool):
+                positive_pattern, negative_pattern = {
+                    "available": (r"(?<!不)(?<!未)可用", r"不可用"),
+                    "success": (success_claim, failure_claim),
+                    "found": (r"已找到|(?<!不)存在", r"不存在|未找到"),
+                    "exists": (r"(?<!不)存在|已找到", r"不存在|未找到"),
+                    "valid": (r"(?<!不)(?<!无)有效", r"无效"),
+                    "enabled": (r"(?<!不)(?<!未)启用", r"未启用|禁用"),
+                }[field_name]
+                positive_claim = (
+                    positive_pattern
+                    if field_name == "success"
+                    else re.search(positive_pattern, answer)
+                )
+                negative_claim = (
+                    negative_pattern
+                    if field_name == "success"
+                    else re.search(negative_pattern, answer)
+                )
+                if not (positive_claim and negative_claim) and (
+                    (expected and negative_claim) or (not expected and positive_claim)
                 ):
                     conflict = (tool_span, field, expected)
-                    break
-            if conflict:
-                break
+            else:
+                status_value = str(expected).lower()
+                completed_claim = success_claim or re.search(r"已完成", answer)
+                cancelled_claim = re.search(r"已取消|取消成功", answer)
+                status_conflict = False
+                if status_value in {"failed", "error"}:
+                    status_conflict = success_claim and not failure_claim
+                elif status_value in {"completed", "success", "succeeded", "已完成"}:
+                    status_conflict = (failure_claim and not success_claim) or (
+                        cancelled_claim and not completed_claim
+                    )
+                elif status_value in {"cancelled", "canceled", "已取消"}:
+                    status_conflict = completed_claim and not cancelled_claim
+                if status_conflict:
+                    conflict = (tool_span, field, expected)
     if conflict:
         tool_span, field, expected = conflict
         findings.append(

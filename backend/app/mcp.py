@@ -7,7 +7,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 from .models import Span, Trace
-from .proxy import HOP_BY_HOP, forward_response_headers
+from .proxy import HOP_BY_HOP, forward_response_headers, request_json_object
 from .rules import run_rules
 
 router = APIRouter()
@@ -96,6 +96,7 @@ def persist_mcp(
 @router.post("/mcp")
 @router.post("/mcp/{path:path}")
 async def mcp_proxy(request: Request, path: str = ""):
+    payload = await request_json_object(request)
     upstream_url = request.headers.get(
         "X-MCP-Upstream", request.app.state.settings.default_mcp_upstream
     )
@@ -104,7 +105,6 @@ async def mcp_proxy(request: Request, path: str = ""):
             status_code=400,
             content={"detail": "未配置 MCP 上游，请设置 X-MCP-Upstream 或 DEFAULT_MCP_UPSTREAM"},
         )
-    payload = await request.json()
     body = await request.body()
     trace_id = request.headers.get("X-AgentTrace-Id", str(uuid4()))
     started_at = datetime.now(UTC)
