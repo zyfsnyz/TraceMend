@@ -51,6 +51,10 @@ docker compose up --build
 - 后端 API：<http://127.0.0.1:8000>
 - 健康检查：<http://127.0.0.1:8000/api/health>
 
+Compose 默认仅将端口绑定到 `127.0.0.1`。如需对外提供服务，必须显式修改 `ports` 绑定，并务必同时设置强 `ADMIN_KEY`、在入口启用 TLS、在可信网关或网络层配置上游地址白名单及代理客户端访问控制。**应用尚未实现上游白名单**，不要将未鉴权代理直接暴露到公网。
+
+前端 Nginx 通过 `client_max_body_size 20m` 将经前端代理的请求体上限设为 20 MiB，超限请求会由 Nginx 拒绝；直接访问后端端口不经过这一前端代理限制。
+
 SQLite 文件持久化在宿主机 `./data/agenttrace.db`。前端等待后端健康后启动。停止服务：
 
 ```bash
@@ -113,7 +117,7 @@ python scripts/seed_demo.py
 
 ### OpenAI Python SDK：只改 `base_url`
 
-将 SDK 的 `base_url` 指向 AgentTrace，并用 `X-Upstream-Base` 选择真实上游；业务代码、模型名和消息结构不变。
+将 SDK 的 `base_url` 指向 AgentTrace，并用 `X-Upstream-Base` 选择真实上游；业务代码、模型名和消息结构不变。API key 会先发送给所配置的 AgentTrace，再转发给上游，因此只应使用可信实例；连接远程实例必须使用 TLS（`https`）。
 
 ```python
 import os
@@ -270,18 +274,18 @@ python scripts/e2e_smoke.py
 该脚本会启动两个仅监听 `127.0.0.1` 随机端口的本地 HTTP 模拟上游，**不访问外网、不需要 key**，实际完成：
 
 1. OpenAI 非流式代理及响应标记、`X-AgentTrace-Id` 检查。
-2. OpenAI SSE 流式代理及完整内容检查。
+2. OpenAI SSE 流式代理：上游发出首个含标记的 `data` chunk 后暂停，客户端必须在放行及上游响应结束前逐行收到它，再检查完整内容与 `[DONE]`。
 3. MCP `tools/call` 代理及工具返回检查。
 4. 轮询详情 API，断言 spans、内容和 usage 已落库，并检查 MCP 工具名、参数和结果。
 5. 下载 Markdown/PDF，检查 Markdown 标题与 PDF `%PDF` 魔数，保存到 `artifacts/`。
 
-默认保留三条验收 Trace 供界面查看；验收成功后自动删除请使用：
+默认保留三条验收 Trace 供界面查看；无论验收成功或失败都要尝试删除本次已创建的 Trace，请使用：
 
 ```bash
 python scripts/e2e_smoke.py --cleanup
 ```
 
-如启用管理鉴权，先设置 `ADMIN_KEY` 环境变量。脚本任一步失败都会以非零状态退出。
+如启用管理鉴权，先设置 `ADMIN_KEY` 环境变量。脚本任一步失败都会以非零状态退出；`--cleanup` 会尝试清理全部本次 Trace，清理失败不会掩盖原始验收异常。
 
 ## 路线图
 

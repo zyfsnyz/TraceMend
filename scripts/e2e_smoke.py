@@ -31,6 +31,10 @@ def json_bytes(value: Any) -> bytes:
 
 class MockOpenAIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    stream_first_sent = threading.Event()
+    stream_release = threading.Event()
+    stream_finished = threading.Event()
+    stream_timeout = 30.0
 
     def do_POST(self) -> None:  # noqa: N802 - http.server 接口
         length = int(self.headers.get("Content-Length", "0"))
@@ -72,23 +76,38 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
-        chunks = [
-            {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "流式验收："}, "finish_reason": None}]},
-            {"choices": [{"index": 0, "delta": {"content": STREAM_MARKER[:18]}, "finish_reason": None}]},
-            {"choices": [{"index": 0, "delta": {"content": STREAM_MARKER[18:]}, "finish_reason": None}]},
+        common = {
+            "id": "chatcmpl-smoke-stream",
+            "object": "chat.completion.chunk",
+            "created": 1762862400,
+            "model": request.get("model", "smoke-model"),
+        }
+        first_chunk = {
+            **common,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": f"流式验收：{STREAM_MARKER}"},
+                "finish_reason": None,
+            }],
+        }
+        remaining_chunks = [
             {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
             {"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 9, "total_tokens": 22}},
         ]
-        for item in chunks:
-            item.setdefault("id", "chatcmpl-smoke-stream")
-            item.setdefault("object", "chat.completion.chunk")
-            item.setdefault("created", 1762862400)
-            item.setdefault("model", request.get("model", "smoke-model"))
-            self.wfile.write(b"data: " + json_bytes(item) + b"\n\n")
+        try:
+            self.wfile.write(b"data: " + json_bytes(first_chunk) + b"\n\n")
             self.wfile.flush()
-            time.sleep(0.02)
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+            self.stream_first_sent.set()
+            if not self.stream_release.wait(self.stream_timeout):
+                return
+            for item in remaining_chunks:
+                item.update(common)
+                self.wfile.write(b"data: " + json_bytes(item) + b"\n\n")
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        finally:
+            self.stream_finished.set()
 
     def log_message(self, format: str, *args: Any) -> None:
         pass
@@ -150,6 +169,48 @@ def request(
             return Response(response.status, response.headers, response.read())
     except urllib.error.HTTPError as exc:
         return Response(exc.code, exc.headers, exc.read())
+
+
+def sse_request_incremental(
+    url: str,
+    payload: Any,
+    headers: dict[str, str] | None,
+    timeout: float,
+    marker: str,
+    upstream_first_sent: threading.Event,
+    upstream_release: threading.Event,
+    upstream_finished: threading.Event,
+) -> Response:
+    """逐行验收 SSE：上游暂停时必须先收到标记，再放行并读完剩余响应。"""
+    all_headers = dict(headers or {})
+    all_headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=json_bytes(payload), headers=all_headers, method="POST")
+    try:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                expect_status(Response(response.status, response.headers, b""))
+                lines: list[bytes] = []
+                marker_bytes = marker.encode("utf-8")
+                while True:
+                    line = response.readline()
+                    if not line:
+                        raise AssertionError("release 前未逐行收到首个含标记的 SSE data chunk")
+                    lines.append(line)
+                    if line.startswith(b"data: ") and marker_bytes in line:
+                        if not upstream_first_sent.is_set():
+                            raise AssertionError("收到标记时上游尚未确认首个 chunk 已发送")
+                        if upstream_release.is_set() or upstream_finished.is_set():
+                            raise AssertionError("首个含标记 chunk 到达前上游已结束或被 release")
+                        break
+                upstream_release.set()
+                for line in response:
+                    lines.append(line)
+                return Response(response.status, response.headers, b"".join(lines))
+        except urllib.error.HTTPError as exc:
+            return Response(exc.code, exc.headers, exc.read())
+    finally:
+        # 断言、连接或读取失败也放行模拟上游，避免服务线程死等。
+        upstream_release.set()
 
 
 def expect_status(response: Response, expected: int = 200) -> None:
@@ -231,17 +292,26 @@ class SmokeTest:
             raise AssertionError(f"Trace 详情未保存标记 {marker}")
 
     def cleanup(self) -> None:
+        errors: list[str] = []
         for trace_id in reversed(self.trace_ids):
-            response = self.api("DELETE", f"/api/traces/{trace_id}")
-            if response.status not in (200, 204, 404):
-                expect_status(response)
-            print(f"[清理] 已删除 {trace_id}")
+            try:
+                response = self.api("DELETE", f"/api/traces/{trace_id}")
+                if response.status not in (200, 204, 404):
+                    expect_status(response)
+                print(f"[清理] 已删除 {trace_id}")
+            except Exception as exc:  # 单个失败不能阻止清理其余本次 Trace
+                errors.append(f"{trace_id}: {exc}")
+        if errors:
+            raise AssertionError("部分 Trace 清理失败：" + "；".join(errors))
 
 
-def run(base_url: str, timeout: float, cleanup: bool) -> None:
-    smoke = SmokeTest(base_url, timeout)
+def run_checks(smoke: SmokeTest, timeout: float) -> None:
     artifact_dir = Path(__file__).resolve().parent.parent / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    MockOpenAIHandler.stream_first_sent = threading.Event()
+    MockOpenAIHandler.stream_release = threading.Event()
+    MockOpenAIHandler.stream_finished = threading.Event()
+    MockOpenAIHandler.stream_timeout = timeout
 
     with ExitStack() as stack:
         openai_base = start_server(stack, MockOpenAIHandler)
@@ -276,8 +346,8 @@ def run(base_url: str, timeout: float, cleanup: bool) -> None:
         print(f"[3/7] 非流式代理及落库通过：trace_id={nonstream_id}")
 
         stream_id = smoke.new_id()
-        stream = request(
-            "POST", smoke.base_url + "/v1/chat/completions",
+        stream = sse_request_incremental(
+            smoke.base_url + "/v1/chat/completions",
             {
                 "model": "smoke-openai-stream-v1",
                 "stream": True,
@@ -286,6 +356,10 @@ def run(base_url: str, timeout: float, cleanup: bool) -> None:
             },
             {"X-Upstream-Base": openai_base + "/v1", "X-AgentTrace-Id": stream_id},
             timeout,
+            STREAM_MARKER,
+            MockOpenAIHandler.stream_first_sent,
+            MockOpenAIHandler.stream_release,
+            MockOpenAIHandler.stream_finished,
         )
         expect_status(stream)
         trace_header(stream, stream_id)
@@ -343,11 +417,25 @@ def run(base_url: str, timeout: float, cleanup: bool) -> None:
         pdf_path.write_bytes(pdf.body)
         print(f"[6/7] Markdown/PDF 报告通过：{md_path}；{pdf_path}")
 
+
+def run(base_url: str, timeout: float, cleanup: bool) -> None:
+    smoke = SmokeTest(base_url, timeout)
+    try:
+        run_checks(smoke, timeout)
+    finally:
+        original_exception = sys.exc_info()[1]
         if cleanup:
-            smoke.cleanup()
+            try:
+                smoke.cleanup()
+            except Exception as cleanup_error:
+                if original_exception is None:
+                    raise
+                print(f"[清理] 失败（保留原验收异常）：{cleanup_error}", file=sys.stderr)
+            else:
+                print("[7/7] 本次验收 Trace 清理完成")
         else:
             print("[7/7] 验收 Trace 已保留供界面查看（使用 --cleanup 可删除）")
-        print("PASS：OpenAI 非流式、SSE、MCP、持久化与报告全流程验收通过。")
+    print("PASS：OpenAI 非流式、SSE、MCP、持久化与报告全流程验收通过。")
 
 
 def main() -> int:
