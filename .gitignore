@@ -1,0 +1,28 @@
+# Runtime
+node_modules/
+dist/
+.vite/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local data and secrets
+.env
+.env.local
+data/*.db
+data/*.db-*
+artifacts/*.pdf
+artifacts/*.md
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs / coverage
+*.log
+coverage/
