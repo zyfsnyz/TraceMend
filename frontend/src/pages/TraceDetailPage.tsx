@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
-import { ArrowLeft, Bot, Clock3, Coins, Download, FileText, GitBranch, RefreshCw, ScanSearch, ShieldAlert } from 'lucide-react';
+import { ArrowLeft, Bot, ChevronDown, Clock3, Coins, Download, FileText, GitBranch, RefreshCw, ScanSearch, ShieldAlert } from 'lucide-react';
 import { downloadReport, getTrace, llmCheckTrace, reanalyzeTrace } from '../api/client';
 import { ApiError } from '../api/client';
 import type { TraceDetail } from '../api/types';
 import { formatDuration, formatFullTime, formatNumber, shortId } from '../lib/format';
-import { ErrorState, Spinner, StatusBadge } from '../components/ui';
+import { ErrorState, JsonBlock, Spinner, StatusBadge } from '../components/ui';
 import { TraceDAG } from '../components/TraceDAG';
 import { ReplayBar } from '../components/ReplayBar';
 import { SpanInspector } from '../components/SpanInspector';
@@ -80,6 +80,7 @@ export function TraceDetailPage() {
       { label: 'Token 用量', value: `${formatNumber(trace.total_tokens)}（入 ${formatNumber(trace.prompt_tokens)} / 出 ${formatNumber(trace.completion_tokens)}）`, icon: Coins },
       { label: '执行节点', value: `${formatNumber(trace.span_count || spans.length)} 个 Span · ${formatNumber(findings.length)} 项发现`, icon: GitBranch },
     ].map(({ label, value, icon: Icon }) => <div className="panel flex items-start gap-3 p-4" key={label}><span className="rounded-lg bg-slate-100 p-2 text-slate-500"><Icon size={15} /></span><div className="min-w-0"><p className="text-[10px] font-medium text-slate-400">{label}</p><p className="mt-1.5 break-words text-xs font-semibold leading-5 text-slate-700">{value}</p></div></div>)}</section>
+    <details className="panel group mb-5 overflow-hidden"><summary className="panel-header cursor-pointer list-none"><span className="panel-title">Trace 原始输入/输出</span><ChevronDown size={15} className="text-slate-400 transition-transform group-open:rotate-180" /></summary><div className="grid gap-4 border-t border-slate-100 p-5 md:grid-cols-2"><section className="min-w-0"><h3 className="mb-2 text-xs font-semibold text-slate-600">原始输入</h3><JsonBlock value={trace.input} /></section><section className="min-w-0"><h3 className="mb-2 text-xs font-semibold text-slate-600">原始输出</h3><JsonBlock value={trace.output} /></section></div></details>
     <div id="dag" className="grid scroll-mt-5 gap-5 2xl:grid-cols-[minmax(0,1fr)_370px]">
       <section className="panel min-w-0 overflow-hidden"><div className="panel-header"><div><h2 className="panel-title">执行 DAG</h2><p className="mt-1 text-[11px] text-slate-400">按父子关系连线；无父子关系时按 sequence 时序连接</p></div><div className="hidden items-center gap-3 text-[10px] text-slate-400 md:flex"><span className="flex items-center gap-1"><i className="h-2 w-2 rounded-full bg-violet-400" />模型</span><span className="flex items-center gap-1"><i className="h-2 w-2 rounded-full bg-amber-400" />工具</span><span className="flex items-center gap-1"><i className="h-2 w-2 rounded-full bg-teal-400" />当前节点</span></div></div><TraceDAG spans={spans} findings={findings} selectedSpanId={selectedSpanId} onSelect={setSelectedSpanId} /><ReplayBar spans={spans} onActiveChange={setSelectedSpanId} /></section>
       <section className="panel min-w-0 overflow-hidden"><div className="panel-header"><div><h2 className="panel-title">Span 详情</h2><p className="mt-1 text-[11px] text-slate-400">与 DAG、时间线和回放同步</p></div>{selectedSpan && <span className="font-mono text-[10px] text-teal-700">已选中</span>}</div><SpanInspector span={selectedSpan} /></section>

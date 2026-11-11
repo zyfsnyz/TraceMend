@@ -78,8 +78,7 @@ export interface TraceFilters {
   q?: string; status?: string; risk?: string; tag?: string;
   from?: string; to?: string; page?: number; page_size?: number;
 }
-export interface DailyStat { date: string; traces: number; errors: number; findings: number; tokens: number }
-export interface ModelStat { model: string; count: number }
+export interface DailyStat { date: string; count: number }
 export interface Stats {
   total_traces: number;
   completed_traces: number;
@@ -89,7 +88,7 @@ export interface Stats {
   total_tokens: number;
   avg_duration_ms: number;
   tool_calls: number;
-  models: ModelStat[];
+  models: Record<string, number>;
   daily: DailyStat[];
   recent_traces?: Trace[];
 }

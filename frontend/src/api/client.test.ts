@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { apiFetch, ApiError, getTraces } from './client';
+import { apiFetch, ApiError, createComment, downloadReport, getTraces, llmCheckTrace, patchComment } from './client';
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 describe('API 错误处理', () => {
   it('保留后端中文 detail 与 HTTP 状态码', async () => {
@@ -28,5 +31,70 @@ describe('API 错误处理', () => {
     const url = new URL(fetchMock.mock.calls[0][0], 'http://localhost');
     expect(url.pathname).toBe('/api/traces');
     expect(Object.fromEntries(url.searchParams)).toEqual({ q: '天气', risk: 'high', page: '2', page_size: '10' });
+  });
+});
+
+describe('评论、LLM 检测与报告 API 契约', () => {
+  const comment = { id: 'comment-1', span_id: null, author: '审计员', body: '结论', status: 'open', created_at: '', updated_at: '' };
+
+  function mockJson(body: unknown, status = 200) {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
+      status, headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('向 Trace 评论端点 POST 作者与内容', async () => {
+    const fetchMock = mockJson(comment);
+    await createComment('trace-1', null, '审计员', '结论');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/traces/trace-1/comments', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ span_id: null, author: '审计员', body: '结论', status: 'open' }),
+    }));
+  });
+
+  it('向 Span 评论端点 POST，并保留 span_id', async () => {
+    const fetchMock = mockJson({ ...comment, span_id: 'span-1' });
+    await createComment('trace-1', 'span-1', '审计员', '结论');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/traces/trace-1/spans/span-1/comments', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ span_id: 'span-1', author: '审计员', body: '结论', status: 'open' }),
+    }));
+  });
+
+  it('PATCH 评论 resolved 状态', async () => {
+    const fetchMock = mockJson({ ...comment, status: 'resolved' });
+    await patchComment('comment-1', 'resolved');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/comments/comment-1', expect.objectContaining({
+      method: 'PATCH', body: JSON.stringify({ status: 'resolved' }),
+    }));
+  });
+
+  it('llm-check 的 409 响应保持失败并携带后端说明', async () => {
+    mockJson({ detail: 'LLM 检测未配置' }, 409);
+
+    await expect(llmCheckTrace('trace-1')).rejects.toMatchObject({
+      name: 'ApiError', status: 409, message: 'LLM 检测未配置',
+    });
+  });
+
+  it('从正确的 report 端点下载 Markdown 文件', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new Blob(['# 审计报告']), {
+      status: 200, headers: { 'Content-Disposition': 'attachment; filename="trace-audit.md"' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:report');
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+    await downloadReport('trace-1', 'md');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/traces/trace-1/report.md');
+    expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:report');
   });
 });
