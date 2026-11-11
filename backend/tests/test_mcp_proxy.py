@@ -10,6 +10,7 @@ async def test_mcp_real_upstream_records_protocol_tool_calls_and_shared_trace(cl
         "X-AgentTrace-Id": "mcp-shared",
         "Authorization": "Bearer mcp-secret",
         "X-MCP-Client": "integration-test",
+        "X-Admin-Key": "must-not-reach-mcp-upstream",
     }
     calls = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -32,6 +33,7 @@ async def test_mcp_real_upstream_records_protocol_tool_calls_and_shared_trace(cl
     assert mcp_upstream.requests[0]["headers"]["x-mcp-client"] == "integration-test"
     assert "x-mcp-upstream" not in mcp_upstream.requests[0]["headers"]
     assert "x-agenttrace-id" not in mcp_upstream.requests[0]["headers"]
+    assert "x-admin-key" not in mcp_upstream.requests[0]["headers"]
 
     detail = await client.get("/api/traces/mcp-shared")
     body = detail.json()

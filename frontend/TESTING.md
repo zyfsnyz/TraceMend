@@ -1,5 +1,7 @@
 # 测试与 RED / GREEN 记录
 
+> 当前最新汇总见 [`../docs/verification.md`](../docs/verification.md)。本文保留各轮修复记录，文中的测试数量是当时的历史值。
+
 核心函数与关键交互均先创建测试并实际运行，确认因实现文件不存在而失败，再实现并运行至通过。
 
 | 测试 | RED 实际结果 | GREEN 实际结果 |
@@ -22,7 +24,7 @@
 - `npm run lint`：通过，无错误与警告。
 - `npx tsc --noEmit`：通过。
 - `npm run build`：通过，Vite 完成 1626 个模块转换。
-- `npm run dev -- --host 0.0.0.0 --port 3000`：首页与 `/guide` 实际返回 HTTP 200；浏览器检查桌面及窄屏渲染。
+- `npm run dev -- --host 127.0.0.1 --port 3000`：首页与 `/guide` 实际返回 HTTP 200；开发服务器默认只监听回环地址；浏览器检查桌面及窄屏渲染。
 
 ## 真实 API 契约与原始数据修复（2026-11-11）
 

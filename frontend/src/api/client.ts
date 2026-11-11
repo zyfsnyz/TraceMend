@@ -1,3 +1,4 @@
+import { getAdminKey, UNAUTHORIZED_EVENT } from '../lib/adminKey';
 import type { Comment, Stats, TraceDetail, TraceFilters, TraceListResponse } from './types';
 
 export class ApiError extends Error {
@@ -14,19 +15,20 @@ async function errorFromResponse(response: Response): Promise<ApiError> {
     if (typeof body.detail === 'string') message = body.detail;
     else if (Array.isArray(body.detail)) message = body.detail.map((item) => item.msg).filter(Boolean).join('；') || message;
   } catch { /* 非 JSON 错误使用状态码说明 */ }
+  if (response.status === 401 && typeof window !== 'undefined') {
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+  }
   return new ApiError(message, response.status);
 }
 
 export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(path, {
-      ...options,
-      headers: {
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-        ...options.headers,
-      },
-    });
+    const headers = new Headers(options.headers);
+    if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+    const adminKey = getAdminKey();
+    if (adminKey) headers.set('X-Admin-Key', adminKey);
+    response = await fetch(path, { ...options, headers });
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') throw error;
     throw new ApiError('无法连接审计服务，请检查后端是否启动。', 0);
@@ -78,15 +80,25 @@ export function llmCheckTrace(id: string): Promise<unknown> {
 
 export async function downloadReport(id: string, format: 'md' | 'pdf'): Promise<void> {
   let response: Response;
+  const adminKey = getAdminKey();
   try {
-    response = await fetch(`/api/traces/${encodeURIComponent(id)}/report.${format}`);
+    const url = `/api/traces/${encodeURIComponent(id)}/report.${format}`;
+    response = adminKey ? await fetch(url, { headers: { 'X-Admin-Key': adminKey } }) : await fetch(url);
   } catch {
     throw new ApiError('无法连接审计服务，请检查后端是否启动。', 0);
   }
   if (!response.ok) throw await errorFromResponse(response);
   const disposition = response.headers.get('Content-Disposition') ?? '';
   const matched = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(disposition)?.[1];
-  const filename = matched ? decodeURIComponent(matched.trim()) : `AgentTrace-${id.slice(0, 8)}-report.${format}`;
+  const fallback = `AgentTrace-${id.slice(0, 8)}-report.${format}`;
+  let filename = fallback;
+  if (matched) {
+    try {
+      filename = decodeURIComponent(matched.trim());
+    } catch {
+      filename = fallback;
+    }
+  }
   const url = URL.createObjectURL(await response.blob());
   const anchor = document.createElement('a');
   anchor.href = url;

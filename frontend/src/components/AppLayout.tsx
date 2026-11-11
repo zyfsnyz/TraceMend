@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
-import { Activity, BookOpenText, GitBranch, HardDrive, LayoutDashboard, ShieldAlert } from 'lucide-react';
+import { Activity, BookOpenText, GitBranch, HardDrive, KeyRound, LayoutDashboard, ShieldAlert } from 'lucide-react';
+import { UNAUTHORIZED_EVENT } from '../lib/adminKey';
+import { AdminKeyPrompt } from './AdminKeyPrompt';
 
 const navigation = [
   { to: '/', label: '总览', icon: LayoutDashboard, end: true },
@@ -11,8 +13,15 @@ const navigation = [
 
 export function AppLayout() {
   const [stored, setStored] = useState(false);
+  const [adminOpen, setAdminOpen] = useState(false);
+  const [pageRevision, setPageRevision] = useState(0);
   useEffect(() => {
     try { localStorage.setItem('agenttrace.workspace', 'active'); setStored(true); } catch { setStored(false); }
+  }, []);
+  useEffect(() => {
+    const openAdmin = () => setAdminOpen(true);
+    window.addEventListener(UNAUTHORIZED_EVENT, openAdmin);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, openAdmin);
   }, []);
   return (
     <div className="min-h-screen bg-[#f5f7fa] lg:flex">
@@ -23,16 +32,19 @@ export function AppLayout() {
         </div>
         <nav aria-label="主导航" className="flex gap-1 overflow-x-auto p-3 lg:mt-4 lg:flex-col lg:overflow-visible lg:px-3">
           {navigation.map(({ to, label, icon: Icon, end }) => <NavLink key={to} to={to} end={end} className={({ isActive }) => `flex h-11 shrink-0 items-center gap-3 rounded-lg px-3.5 text-sm font-medium transition-colors lg:w-full ${isActive ? 'bg-teal-400/[.13] text-teal-300 shadow-[inset_2px_0_0_#2dd4bf]' : 'text-slate-400 hover:bg-white/[.05] hover:text-slate-100'}`}><Icon size={17} strokeWidth={1.8} /><span>{label}</span></NavLink>)}
+          <button type="button" className="ml-auto flex h-11 shrink-0 items-center justify-center rounded-lg px-3 text-slate-500 hover:bg-white/[.05] hover:text-teal-300 lg:hidden" aria-label="管理密钥" onClick={() => setAdminOpen(true)}><KeyRound size={18} /></button>
         </nav>
         <div className="mt-auto hidden px-5 pb-5 lg:block">
           <div className="rounded-lg border border-white/[.07] bg-black/10 p-3.5">
             <div className="flex items-center gap-2 text-xs font-medium text-slate-300"><HardDrive size={14} className="text-slate-500" />本地工作区</div>
             <div className="mt-2 flex items-center gap-2 text-[11px] text-slate-500"><span className={`h-1.5 w-1.5 rounded-full ${stored ? 'bg-teal-400' : 'bg-amber-400'}`} />{stored ? '界面状态已保存' : '本地存储不可用'}</div>
+            <button type="button" className="mt-3 flex items-center gap-1.5 text-[11px] text-slate-400 transition-colors hover:text-teal-300" onClick={() => setAdminOpen(true)}><KeyRound size={13} />管理密钥</button>
           </div>
           <p className="mt-4 text-[10px] leading-4 text-slate-600">让每一次模型决策与工具调用<br />都有迹可循。</p>
         </div>
       </aside>
-      <main className="min-w-0 flex-1 lg:ml-[232px]"><Outlet /></main>
+      <main className="min-w-0 flex-1 lg:ml-[232px]"><div key={pageRevision}><Outlet /></div></main>
+      <AdminKeyPrompt open={adminOpen} onClose={() => setAdminOpen(false)} onSaved={() => { setAdminOpen(false); setPageRevision((value) => value + 1); }} />
     </div>
   );
 }

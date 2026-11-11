@@ -1,4 +1,6 @@
+import hashlib
 import math
+import re
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -16,6 +18,14 @@ from .schemas import CommentCreate, CommentPatch, IngestIn, TraceCommentIn
 from .serializers import comment_dict, finding_dict, span_dict, trace_dict
 
 router = APIRouter(prefix="/api")
+
+
+def report_content_disposition(trace_id: str, extension: str) -> str:
+    """Build an ASCII-only attachment name from an untrusted trace id."""
+    digest = hashlib.sha256(trace_id.encode("utf-8")).hexdigest()[:8]
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", trace_id).strip("-")[:48]
+    stem = f"{slug}-{digest}" if slug else digest
+    return f'attachment; filename="agenttrace-{stem}.{extension}"'
 
 
 @router.post("/traces/ingest")
@@ -190,7 +200,7 @@ def export_markdown_report(trace_id: str, request: Request):
     return Response(
         content=content,
         media_type="text/markdown; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="agenttrace-{trace_id}.md"'},
+        headers={"Content-Disposition": report_content_disposition(trace_id, "md")},
     )
 
 
@@ -204,7 +214,7 @@ def export_pdf_report(trace_id: str, request: Request):
     return Response(
         content=content,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="agenttrace-{trace_id}.pdf"'},
+        headers={"Content-Disposition": report_content_disposition(trace_id, "pdf")},
     )
 
 

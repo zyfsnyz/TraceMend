@@ -13,6 +13,7 @@ function isSensitiveKey(key: string): boolean {
     || normalized.includes('password')
     || normalized.includes('passwd')
     || normalized.includes('authorization')
+    || normalized.includes('adminkey')
     || normalized.includes('cookie')
     || normalized.includes('credential')
     || normalized.includes('privatekey')

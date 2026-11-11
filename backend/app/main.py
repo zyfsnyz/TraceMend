@@ -13,6 +13,11 @@ from .mcp import router as mcp_router
 from .proxy import router as proxy_router
 
 
+def admin_key_matches(candidate: str, expected: str) -> bool:
+    """Constant-time comparison; non-ASCII candidates compare safely as false."""
+    return secrets.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+
+
 def create_app() -> FastAPI:
     settings = Settings()
     engine = make_engine(settings.db_url)
@@ -39,7 +44,7 @@ def create_app() -> FastAPI:
             and request.url.path.startswith("/api/")
             and request.url.path != "/api/health"
             and request.method != "OPTIONS"
-            and not secrets.compare_digest(
+            and not admin_key_matches(
                 request.headers.get("X-Admin-Key", ""), settings.admin_key
             )
         ):

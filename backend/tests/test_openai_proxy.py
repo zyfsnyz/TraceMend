@@ -31,6 +31,7 @@ async def test_openai_nonstream_real_upstream_persists_trace_and_forwards_auth(
             "X-AgentTrace-Id": "proxy-nonstream",
             "Authorization": "Bearer local-secret",
             "X-Custom-Header": "forward-me",
+            "X-Admin-Key": "must-not-reach-upstream",
         },
     )
 
@@ -43,6 +44,7 @@ async def test_openai_nonstream_real_upstream_persists_trace_and_forwards_auth(
     assert upstream["headers"]["x-custom-header"] == "forward-me"
     assert "x-upstream-base" not in upstream["headers"]
     assert "x-agenttrace-id" not in upstream["headers"]
+    assert "x-admin-key" not in upstream["headers"]
 
     detail = await client.get("/api/traces/proxy-nonstream")
     assert detail.status_code == 200
@@ -60,6 +62,7 @@ async def test_openai_nonstream_real_upstream_persists_trace_and_forwards_auth(
     assert tool["tool_arguments"] == {"city": "北京"}
     assert tool["metadata"]["tool_schema"]["required"] == ["city"]
     assert "local-secret" not in detail.text
+    assert "must-not-reach-upstream" not in detail.text
 
 
 @pytest.mark.asyncio

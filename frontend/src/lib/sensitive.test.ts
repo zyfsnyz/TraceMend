@@ -32,6 +32,8 @@ describe('敏感字段展示保护', () => {
       Cookie: 'cookie-value',
       credentials: 'credential-value',
       'PRIVATE-KEY': 'private-key-value',
+      admin_key: 'admin-key-value',
+      'X-Admin-Key': 'admin-header-value',
     };
     const result = sanitizeSensitive({ nested: [{ request: secrets }], prompt_tokens: 42, total_tokens: 42 });
 
@@ -40,7 +42,7 @@ describe('敏感字段展示保护', () => {
       prompt_tokens: 42,
       total_tokens: 42,
     });
-    expect(JSON.stringify(result)).not.toMatch(/openai-key-value|token-value|secret-value|password-value|cookie-value|private-key-value/);
+    expect(JSON.stringify(result)).not.toMatch(/openai-key-value|token-value|secret-value|password-value|cookie-value|private-key-value|admin-key-value|admin-header-value/);
   });
 
   it('脱敏嵌入字符串的 Bearer 与 sk 凭证，同时保留普通中文文本', () => {

@@ -2,6 +2,40 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 
+def test_admin_key_comparison_is_safe_for_non_ascii_candidates():
+    from app.main import admin_key_matches
+
+    assert admin_key_matches("local-admin", "local-admin") is True
+    assert admin_key_matches("wrong", "local-admin") is False
+    assert admin_key_matches("é", "local-admin") is False
+    assert admin_key_matches("", "local-admin") is False
+
+
+def test_settings_reject_non_ascii_admin_key():
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    with pytest.raises(ValidationError, match="ADMIN_KEY 只能使用 ASCII"):
+        Settings(admin_key="测试密钥")
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_admin_header_is_rejected_without_server_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_URL", f"sqlite:///{tmp_path / 'header.db'}")
+    monkeypatch.setenv("ADMIN_KEY", "local-admin")
+    from app.main import create_app
+
+    application = create_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://testserver"
+    ) as client:
+        response = await client.get(
+            "/api/traces", headers=[(b"x-admin-key", b"\xe9")]
+        )
+        assert response.status_code == 401
+
+
 @pytest.mark.asyncio
 async def test_admin_key_protects_api_except_health_and_cors_allows_frontend(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_URL", f"sqlite:///{tmp_path / 'secure.db'}")

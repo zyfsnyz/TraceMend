@@ -14,8 +14,7 @@ venv/
 .env
 .env.local
 **/data/
-artifacts/*.pdf
-artifacts/*.md
+artifacts/
 
 # OS / editors
 .DS_Store

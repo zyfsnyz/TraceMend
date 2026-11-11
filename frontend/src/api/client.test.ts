@@ -4,7 +4,21 @@ import { apiFetch, ApiError, createComment, downloadReport, getTraces, llmCheckT
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  try { window.sessionStorage.removeItem('agenttrace.adminKey'); } catch { /* happy-dom 未提供 Storage 时忽略 */ }
 });
+
+function stubSessionStorage() {
+  const data = new Map<string, string>();
+  Object.defineProperty(window, 'sessionStorage', {
+    configurable: true,
+    value: {
+      getItem: (key: string) => data.get(key) ?? null,
+      setItem: (key: string, value: string) => data.set(key, value),
+      removeItem: (key: string) => data.delete(key),
+    },
+  });
+  return data;
+}
 
 describe('API 错误处理', () => {
   it('保留后端中文 detail 与 HTTP 状态码', async () => {
@@ -96,5 +110,61 @@ describe('评论、LLM 检测与报告 API 契约', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/traces/trace-1/report.md');
     expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:report');
+  });
+
+  it('开启管理鉴权时报告下载同样携带密钥', async () => {
+    stubSessionStorage();
+    window.sessionStorage.setItem('agenttrace.adminKey', 'local-admin');
+    const fetchMock = vi.fn().mockResolvedValue(new Response(new Blob(['# 审计报告']), {
+      status: 200, headers: { 'Content-Disposition': 'attachment; filename="trace-audit.md"' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:report');
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+    await downloadReport('trace-1', 'md');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/traces/trace-1/report.md', {
+      headers: { 'X-Admin-Key': 'local-admin' },
+    });
+  });
+
+  it('Content-Disposition 含非法百分号编码时仍完成下载并使用安全回退文件名', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new Blob(['# 审计报告']), {
+      status: 200, headers: { 'Content-Disposition': 'attachment; filename="%E0%A4%A.md"' },
+    })));
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:report');
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    let anchor: HTMLAnchorElement | undefined;
+    const createElement = document.createElement.bind(document);
+    vi.spyOn(document, 'createElement').mockImplementation(((tag: string, options?: ElementCreationOptions) => {
+      const element = createElement(tag, options);
+      if (tag === 'a') anchor = element as HTMLAnchorElement;
+      return element;
+    }) as typeof document.createElement);
+
+    await expect(downloadReport('trace-1', 'md')).resolves.toBeUndefined();
+
+    expect(anchor?.download).toBe('AgentTrace-trace-1-report.md');
+  });
+});
+
+describe('管理密钥请求头', () => {
+  it('保存的密钥随 API 请求发送，并在 401 时触发提示事件', async () => {
+    stubSessionStorage();
+    window.sessionStorage.setItem('agenttrace.adminKey', 'local-admin');
+    const unauthorized = vi.fn();
+    window.addEventListener('agenttrace:unauthorized', unauthorized);
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: '管理密钥无效' }), {
+      status: 401, headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(apiFetch('/api/traces')).rejects.toMatchObject({ status: 401 });
+    expect(fetchMock.mock.calls[0][1].headers.get('X-Admin-Key')).toBe('local-admin');
+    expect(unauthorized).toHaveBeenCalledTimes(1);
+    window.removeEventListener('agenttrace:unauthorized', unauthorized);
   });
 });

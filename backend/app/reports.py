@@ -1,5 +1,6 @@
 # ruff: noqa: E501 - 审计报告模板包含较长中文说明，按 Markdown/PDF 语义阅读
 import json
+import re
 from collections import Counter
 from io import BytesIO
 from pathlib import Path
@@ -42,8 +43,25 @@ def text(value: Any, limit: int = 360) -> str:
     return value or "—"
 
 
+def markdown_text(value: Any, limit: int = 360) -> str:
+    """Escape untrusted audit evidence so Markdown cannot load remote images or links."""
+    escaped = escape(text(value, limit))
+    escaped = re.sub(r"([\\`*_{}\[\]()#+!|])", r"\\\1", escaped)
+    return escaped.replace("\r\n", "\n").replace("\n", "<br>")
+
+
 def markdown_cell(value: Any, limit: int = 360) -> str:
-    return text(value, limit).replace("|", "\\|").replace("\n", "<br>")
+    return markdown_text(value, limit)
+
+
+def markdown_code(value: Any) -> str:
+    return (
+        str(value)
+        .replace("`", "'")
+        .replace("|", "\\|")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
 
 
 def fmt_duration(value: Any) -> str:
@@ -66,7 +84,7 @@ def generated_at() -> str:
 def risk_summary(trace: Trace) -> str:
     counts = Counter(finding.severity for finding in trace.findings)
     if not counts:
-        return "未发现规则或模型风险线索。"
+        return "未发现规则或模型风险线索"
     return "、".join(
         f"{SEVERITY_LABELS.get(severity, severity)}风险 {counts[severity]} 项"
         for severity in ("critical", "high", "medium", "low")
@@ -83,17 +101,28 @@ def span_summary(span: Span, limit: int = 220) -> str:
     return "—"
 
 
-def comment_lines(trace: Trace) -> list[str]:
+def comment_lines(trace: Trace, *, markdown: bool = True) -> list[str]:
     if not trace.comments:
         return ["暂无审计评论。"]
     lines = []
     for comment in trace.comments:
-        scope = f"Span {comment.span_id}" if comment.span_id else "整条链路"
         state = "已解决" if comment.status == "resolved" else "待处理"
-        lines.append(
-            f"- **{text(comment.author, 80)}**（{state}，{scope}，"
-            f"{iso(comment.created_at)}）：{text(comment.body, 1200)}"
-        )
+        if markdown:
+            scope = (
+                f"Span {markdown_text(comment.span_id, 120)}"
+                if comment.span_id
+                else "整条链路"
+            )
+            lines.append(
+                f"- **{markdown_text(comment.author, 80)}**（{state}，{scope}，"
+                f"{iso(comment.created_at)}）：{markdown_text(comment.body, 1200)}"
+            )
+        else:
+            scope = f"Span {text(comment.span_id, 120)}" if comment.span_id else "整条链路"
+            lines.append(
+                f"- {text(comment.author, 80)}（{state}，{scope}，"
+                f"{iso(comment.created_at)}）：{text(comment.body, 1200)}"
+            )
     return lines
 
 
@@ -109,7 +138,7 @@ def render_markdown(trace: Trace) -> str:
         "| 字段 | 内容 |",
         "| --- | --- |",
         f"| 链路名称 | {markdown_cell(trace.name)} |",
-        f"| Trace ID | `{trace.id}` |",
+        f"| Trace ID | `{markdown_code(trace.id)}` |",
         f"| 来源 / 模型 | {markdown_cell(trace.source)} / {markdown_cell(trace.model)} |",
         f"| 状态 | {markdown_cell(trace.status)} |",
         f"| 开始时间 | {iso(trace.started_at) or '—'} |",
@@ -135,13 +164,13 @@ def render_markdown(trace: Trace) -> str:
         for index, finding in enumerate(trace.findings, 1):
             lines.extend(
                 [
-                    f"### 3.{index} [{SEVERITY_LABELS.get(finding.severity, finding.severity)}] {text(finding.title, 160)}",
+                    f"### 3.{index} [{SEVERITY_LABELS.get(finding.severity, finding.severity)}] {markdown_text(finding.title, 160)}",
                     "",
-                    f"- **类别**：{text(finding.category, 80)}",
-                    f"- **来源**：{'模型二阶检测' if finding.source == 'llm' else '规则检测'}（`{finding.rule_code}`）",
-                    f"- **证据位置**：{f'`{finding.span_id}`' if finding.span_id else '整条链路'}",
-                    f"- **解释**：{text(finding.explanation, 1600)}",
-                    f"- **证据摘录**：{text(finding.evidence, 1000)}",
+                    f"- **类别**：{markdown_text(finding.category, 80)}",
+                    f"- **来源**：{'模型二阶检测' if finding.source == 'llm' else '规则检测'}（`{markdown_code(finding.rule_code)}`）",
+                    f"- **证据位置**：{f'`{markdown_code(finding.span_id)}`' if finding.span_id else '整条链路'}",
+                    f"- **解释**：{markdown_text(finding.explanation, 1600)}",
+                    f"- **证据摘录**：{markdown_text(finding.evidence, 1000)}",
                     "",
                 ]
             )
@@ -170,12 +199,12 @@ def render_markdown(trace: Trace) -> str:
         for span in tool_spans:
             lines.extend(
                 [
-                    f"### {span.sequence}. {text(span.name or span.tool_name, 100)}",
+                    f"### {span.sequence}. {markdown_text(span.name or span.tool_name, 100)}",
                     "",
-                    f"- **工具**：`{text(span.tool_name or '未命名', 120)}`",
-                    f"- **状态**：{text(span.status, 40)}",
-                    f"- **参数**：{text(span.tool_arguments, 800)}",
-                    f"- **返回/错误**：{text(span.tool_result if span.tool_result is not None else span.error, 1200)}",
+                    f"- **工具**：`{markdown_code(span.tool_name or '未命名')}`",
+                    f"- **状态**：{markdown_text(span.status, 40)}",
+                    f"- **参数**：{markdown_text(span.tool_arguments, 800)}",
+                    f"- **返回/错误**：{markdown_text(span.tool_result if span.tool_result is not None else span.error, 1200)}",
                     "",
                 ]
             )
@@ -190,7 +219,7 @@ def render_markdown(trace: Trace) -> str:
             "- 报告中已对常见认证头、API Key 等敏感值做脱敏；仍建议在对外分享前按组织制度复核。",
             "- 本报告用于工程复盘、测试归档与合规留痕，不构成事实或法律结论。",
             "",
-            f"_AgentTrace · Trace `{trace.id}` · {generated_at()}_",
+            f"_AgentTrace · Trace `{markdown_code(trace.id)}` · {generated_at()}_",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -362,7 +391,7 @@ def render_pdf(trace: Trace) -> bytes:
         )
     )
     story.extend([timeline, Paragraph("5. 审计评论与处理状态", styles["h2"])])
-    for line in comment_lines(trace):
+    for line in comment_lines(trace, markdown=False):
         story.append(pdf_paragraph(line.lstrip("- "), styles["small"], 1200))
     story.extend([PageBreak(), Paragraph("6. 证据与局限", styles["h2"])])
     for line in (

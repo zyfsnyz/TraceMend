@@ -51,7 +51,7 @@ docker compose up --build
 - 后端 API：<http://127.0.0.1:8000>
 - 健康检查：<http://127.0.0.1:8000/api/health>
 
-Compose 默认仅将端口绑定到 `127.0.0.1`。如需对外提供服务，必须显式修改 `ports` 绑定，并务必同时设置强 `ADMIN_KEY`、在入口启用 TLS、在可信网关或网络层配置上游地址白名单及代理客户端访问控制。**应用尚未实现上游白名单**，不要将未鉴权代理直接暴露到公网。
+Compose 默认仅将端口绑定到 `127.0.0.1`。如需对外提供服务，必须显式修改 `ports` 绑定，并务必同时设置强 `ADMIN_KEY`、在入口启用 TLS、在可信网关或网络层配置上游地址白名单及代理客户端访问控制。**设置 `ADMIN_KEY` 不会保护 `/v1` 和 `/mcp`**：这两个协议代理无论是否设置管理密钥，都必须由反向代理、网关鉴权或网络 ACL 限制访问；应用也尚未实现上游地址白名单，不要将未鉴权代理直接暴露到公网。
 
 前端 Nginx 通过 `client_max_body_size 20m` 将经前端代理的请求体上限设为 20 MiB，超限请求会由 Nginx 拒绝；直接访问后端端口不经过这一前端代理限制。
 
@@ -110,7 +110,7 @@ python scripts/seed_demo.py
 | `CHECK_MODEL_KEY` | 空 | 可选检测模型密钥 |
 | `CHECK_MODEL_NAME` | `gpt-4o-mini` | 可选检测模型名称 |
 | `CHECK_MODEL_TIMEOUT` | `60` | 可选检测模型请求超时秒数 |
-| `ADMIN_KEY` | 空 | 设置后，除健康检查外的 `/api/*` 需要 `X-Admin-Key` |
+| `ADMIN_KEY` | 空 | 设置后，除健康检查外的 `/api/*` 需要 `X-Admin-Key`；只能使用 ASCII 字符 |
 
 `.env` 被 Git 忽略，`.env.example` 不含真实密钥。
 
@@ -214,15 +214,16 @@ curl -X POST http://127.0.0.1:8000/api/traces/ingest \
 ## 数据隐私与安全边界
 
 - Trace、prompt、模型输出、工具参数、工具结果、Finding 和评论默认保存在本地 SQLite；这些数据本身可能含敏感信息，请按日志级别保护 `./data` 和导出报告。
-- 上游 `Authorization` 只用于当次代理转发，不作为审计内容写入数据库；代理 API key 与 `CHECK_MODEL_KEY` 不得提交到 Git。
+- 上游 `Authorization` 只用于当次代理转发，不作为审计内容写入数据库；`X-Admin-Key` 也不会转发给上游。代理 API key 与 `CHECK_MODEL_KEY` 不得提交到 Git。
 - `X-Upstream-Base` 和 `X-MCP-Upstream` 能把数据发送到指定服务。只允许可信客户端访问代理，部署到共享环境时应增加网络访问控制、TLS 和上游地址白名单。
-- `ADMIN_KEY` 保护管理 API，不是上游 API key，也不替代公网身份认证方案。
+- `ADMIN_KEY` 保护管理 API，不是上游 API key，也不替代公网身份认证方案。`ADMIN_KEY` 只能使用 ASCII 字符（HTTP 请求头限制），非 ASCII 配置会在启动时直接报错。前端收到 401 会自动打开“管理密钥设置”，验证后只把密钥保存在当前标签页的 `sessionStorage`，并在 API 请求和报告下载中附带 `X-Admin-Key`。
+- `ADMIN_KEY` **不保护** `/v1` 与 `/mcp` 协议代理；这两个入口需要由反向代理、网络 ACL 或网关鉴权限制访问。
 - 免费规则在本地运行，不需要外网。只有显式启用并调用二阶 LLM 检测时，检测所需内容才会发往配置的检测模型服务。
 - `DELETE /api/traces/{id}` 删除本地审计记录；宿主机备份、已导出报告和上游服务商的数据需分别管理。
 
 ## API 一览
 
-管理 API 在设置 `ADMIN_KEY` 后需要请求头 `X-Admin-Key`（健康检查除外）。
+管理 API 在设置 `ADMIN_KEY` 后需要请求头 `X-Admin-Key`（健康检查除外）。前端遇到 401 会自动提示输入密钥并重载当前页面；也可以用浏览器标签页内的密钥按钮手动设置或清除。
 
 | 方法与路径 | 说明 |
 |---|---|
@@ -287,6 +288,8 @@ python scripts/e2e_smoke.py --cleanup
 ```
 
 如启用管理鉴权，先设置 `ADMIN_KEY` 环境变量。脚本任一步失败都会以非零状态退出；`--cleanup` 会尝试清理全部本次 Trace，清理失败不会掩盖原始验收异常。
+
+本机已执行的测试、浏览器验收、Hermes 接入和未执行项记录在 [`docs/verification.md`](docs/verification.md)。
 
 ## 路线图
 

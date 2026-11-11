@@ -27,7 +27,7 @@ HOP_BY_HOP = {
 
 
 def forward_request_headers(request: Request) -> dict[str, str]:
-    excluded = HOP_BY_HOP | {"x-upstream-base", "x-agenttrace-id"}
+    excluded = HOP_BY_HOP | {"x-upstream-base", "x-agenttrace-id", "x-admin-key"}
     return {key: value for key, value in request.headers.items() if key.lower() not in excluded}
 
 
