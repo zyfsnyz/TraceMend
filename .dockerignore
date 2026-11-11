@@ -5,6 +5,7 @@
 !.env.example
 
 data/
+**/data/
 artifacts/
 
 **/node_modules/

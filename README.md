@@ -70,13 +70,13 @@ docker compose down
 ```bash
 cd backend
 python -m pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 ```bash
 cd frontend
 npm install
-npm run dev -- --host 0.0.0.0 --port 3000
+npm run dev -- --host 127.0.0.1 --port 3000
 ```
 
 本地默认数据库为 `sqlite:///./data/agenttrace.db`，路径相对于后端工作目录；请先创建 `backend/data/`（或设置自己的 `DB_URL`）。也可通过环境变量加载根目录 `.env` 中的配置，不要把密钥写进源码。
