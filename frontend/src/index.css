@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root { color: #172437; background: #f5f7fa; font-synthesis: none; text-rendering: optimizeLegibility; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-width: 320px; min-height: 100vh; }
+  button, input, select, textarea { font: inherit; }
+  button, a { -webkit-tap-highlight-color: transparent; }
+  button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+    outline: 2px solid #14a98b; outline-offset: 2px;
+  }
+  ::selection { background: #c8f2e8; color: #123c35; }
+}
+
+@layer components {
+  .panel { @apply rounded-xl border border-slate-200/90 bg-white shadow-panel; }
+  .panel-header { @apply flex min-h-14 items-center justify-between gap-3 border-b border-slate-100 px-5 py-3.5; }
+  .panel-title { @apply text-sm font-semibold tracking-tight text-ink-900; }
+  .page-title { @apply text-[26px] font-semibold tracking-[-0.025em] text-ink-950; }
+  .page-subtitle { @apply mt-1.5 text-sm leading-6 text-slate-500; }
+  .btn { @apply inline-flex h-9 shrink-0 items-center justify-center gap-2 rounded-lg border px-3.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50; }
+  .btn-primary { @apply btn border-teal-600 bg-teal-600 text-white shadow-sm hover:border-teal-700 hover:bg-teal-700; }
+  .btn-secondary { @apply btn border-slate-200 bg-white text-slate-700 shadow-sm hover:border-slate-300 hover:bg-slate-50; }
+  .btn-danger { @apply btn border-red-200 bg-white text-red-600 hover:bg-red-50; }
+  .icon-button { @apply inline-flex items-center justify-center rounded-md text-slate-500 transition-colors hover:bg-white hover:text-ink-900 disabled:cursor-not-allowed disabled:opacity-30; }
+  .input { @apply h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm text-ink-900 placeholder:text-slate-400 hover:border-slate-300 focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/10; }
+  .label { @apply mb-1.5 block text-xs font-medium text-slate-600; }
+  .badge { @apply inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium leading-4; }
+  .table-heading { @apply whitespace-nowrap px-4 py-3 text-left text-[11px] font-semibold uppercase tracking-wider text-slate-400; }
+  .table-cell { @apply px-4 py-3.5 text-sm; }
+  .code-block { @apply max-h-[360px] overflow-auto whitespace-pre-wrap break-all rounded-lg border border-slate-200 bg-slate-950 p-3.5 font-mono text-xs leading-5 text-slate-200; }
+  .skeleton { @apply animate-pulse rounded-md bg-slate-200/70; }
+}
+
+.react-flow { background-color: #f8fafc; background-image: radial-gradient(#d9e1e9 0.8px, transparent 0.8px); background-size: 18px 18px; }
+.react-flow__attribution { background: transparent !important; color: #94a3b8 !important; }
+.react-flow__controls { overflow: hidden; border: 1px solid #e2e8f0; border-radius: 8px; box-shadow: 0 3px 12px rgba(15, 23, 42, .07); }
+.react-flow__controls-button { border-bottom-color: #edf1f5 !important; fill: #334155 !important; }
+.react-flow__edge-path { transition: stroke .15s; }
+.react-flow__edge.selected .react-flow__edge-path { stroke: #14a98b !important; }
+
+* { scrollbar-width: thin; scrollbar-color: #cbd5e1 transparent; }
+*::-webkit-scrollbar { width: 7px; height: 7px; }
+*::-webkit-scrollbar-thumb { border-radius: 8px; background: #cbd5e1; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
