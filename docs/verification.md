@@ -64,9 +64,16 @@ python scripts/e2e_smoke.py --cleanup
 4. 请求成功，AgentTrace 中生成一条 `completed` 的 Trace：3 个 Span、16,145 tokens；包含 system、user 和模型响应三条记录。
 5. 同一轮集成测试也抓到了上游额度耗尽导致的 429 失败重试链路，证明失败请求会被如实记录。
 
-二阶 LLM 幻觉检测依赖额外的检测模型凭据，本次未使用真实检测模型；未配置时的 409 行为有自动化测试覆盖。
+### 二阶 LLM 真实模型验收（2026-11-12）
+
+使用现有 **Agnes** 检测服务，配置为 `CHECK_MODEL_BASE=https://apihub.agnes-ai.com/v1`、`CHECK_MODEL_NAME=agnes-3.0-flash`；密钥只写入被 Git 忽略的本地 `.env`，未打印或提交。
+
+1. 受控矛盾 Trace `llm-live-agnes-001`：工具明确返回“仓库缺货，订单未发货”，最终回答却声称已发货并编造物流单号。`POST /api/traces/{id}/llm-check` 返回 HTTP 200，`llm_finding_count=1`。
+2. Agnes 生成一条高风险 Finding：`事实冲突 / 工具返回失败但回答声称成功`，正确定位到 `llm-live-answer` Span，并引用工具返回与最终回答作为证据。
+3. 真实 Hermes Trace `8563ae08-2309-4e1e-9040-369581172ff5` 同样完成检测，HTTP 200、`llm_check.status=completed`；模型按保守策略返回 0 条 Finding。
+4. 浏览器详情页已实际显示 `llm` 来源、严重度、标题、解释和证据；Markdown 与 PDF 报告均包含该 LLM Finding，PDF 通过 `pdftotext` 复核。
+5. 检测响应与 Trace 详情中未出现 `Authorization` 或 `CHECK_MODEL_KEY`。本地证据保存在被 Git 忽略的 `artifacts/llm-live-verification.json`、`artifacts/llm-live-check.png` 和对应报告中。
 
 ### 未执行项
 
 - 本机没有安装 Docker，未实际执行容器构建和 `docker compose up`。已验证 Compose YAML 可解析、服务端口映射为 `127.0.0.1`，但容器运行时仍需在安装 Docker 的环境复验。
-- 未用真实二阶检测模型跑完整幻觉比对；需用户提供兼容的模型地址、模型名和密钥后验证。
