@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any, Literal
+from urllib.parse import parse_qsl, unquote, urlsplit
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -96,3 +97,178 @@ class CommentPatch(BaseModel):
         if self.author is None and self.body is None and self.status is None:
             raise ValueError("至少提供一个待更新字段")
         return self
+
+
+SENSITIVE_QUERY_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "key",
+        "token",
+        "access_token",
+        "authorization",
+        "auth",
+        "secret",
+        "password",
+        "credential",
+    }
+)
+
+
+def has_sensitive_query(query: str) -> bool:
+    return any(
+        key.casefold() in SENSITIVE_QUERY_KEYS
+        for key, _ in parse_qsl(query, keep_blank_values=True)
+    )
+
+
+def redact_url_credentials(value: str) -> str:
+    """Return a public-safe URL: no userinfo, no fragment, sensitive query values masked.
+
+    Non-sensitive query parameters are preserved verbatim so legacy URLs such as
+    ``...?tenant=cn`` remain usable in the UI, but nothing that looks like a
+    credential may be echoed back to a client.
+    """
+    if not value:
+        return value
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return ""
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[1]
+    segments = []
+    for segment in parsed.query.split("&"):
+        if not segment:
+            continue
+        key, _, _ = segment.partition("=")
+        if unquote(key).casefold() in SENSITIVE_QUERY_KEYS:
+            segments.append(f"{key}=REDACTED")
+        else:
+            segments.append(segment)
+    return parsed._replace(
+        netloc=netloc, query="&".join(segments), fragment=""
+    ).geturl()
+
+
+def http_url(value: str, *, allow_blank: bool = False, allow_query: bool = False) -> str:
+    value = value.strip()
+    if allow_blank and not value:
+        return value
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("必须是有效的 http(s) 地址，且不能包含用户名或密码")
+    if parsed.fragment or (parsed.query and not allow_query):
+        raise ValueError("地址不能包含查询参数或片段")
+    if allow_query and has_sensitive_query(parsed.query):
+        raise ValueError("MCP 地址不能包含凭据查询参数")
+    return value.rstrip("/")
+
+
+class SettingsPatch(BaseModel):
+    default_upstream_base: str | None = None
+    default_upstream_model: str | None = None
+    default_upstream_key: str | None = None
+    default_mcp_upstream: str | None = None
+    default_mcp_key: str | None = None
+    enable_llm_check: bool | None = None
+    check_model_base: str | None = None
+    check_model_key: str | None = None
+    check_model_name: str | None = None
+    check_model_timeout: float | None = Field(default=None, ge=1, le=300)
+    gateway_daily_token_budget: int | None = Field(default=None, ge=0, le=10**12)
+    gateway_failure_threshold: int | None = Field(default=None, ge=1, le=20)
+    gateway_cooldown_seconds: int | None = Field(default=None, ge=1, le=3600)
+    default_input_price_per_million: float | None = Field(default=None, ge=0, le=10**6)
+    default_output_price_per_million: float | None = Field(default=None, ge=0, le=10**6)
+
+    @model_validator(mode="before")
+    @classmethod
+    def non_secret_fields_cannot_be_null(cls, data):
+        if isinstance(data, dict):
+            secret_fields = {"default_upstream_key", "default_mcp_key", "check_model_key"}
+            for field, value in data.items():
+                if field in cls.model_fields and field not in secret_fields and value is None:
+                    raise ValueError(f"{field} 不能为 null")
+        return data
+
+    @field_validator("default_upstream_base", "check_model_base")
+    @classmethod
+    def required_http_url(cls, value: str | None) -> str | None:
+        return http_url(value) if value is not None else None
+
+    @field_validator("default_mcp_upstream")
+    @classmethod
+    def optional_http_url(cls, value: str | None) -> str | None:
+        return http_url(value, allow_blank=True, allow_query=True) if value is not None else None
+
+
+class SettingsTestIn(BaseModel):
+    kind: Literal["openai", "check", "mcp"]
+
+
+class RouteCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    match_model: str = Field(min_length=1, max_length=120)
+    target_model: str = Field(min_length=1, max_length=120)
+    upstream_base: str
+    api_key: str | None = None
+    priority: int = Field(default=100, ge=0, le=100000)
+    enabled: bool = True
+    input_price_per_million: float = Field(default=0, ge=0, le=10**6)
+    output_price_per_million: float = Field(default=0, ge=0, le=10**6)
+
+    @field_validator("name", "match_model", "target_model")
+    @classmethod
+    def route_text_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("不能为空")
+        return value
+
+    @field_validator("upstream_base")
+    @classmethod
+    def route_http_url(cls, value: str) -> str:
+        return http_url(value)
+
+
+class RoutePatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    match_model: str | None = Field(default=None, min_length=1, max_length=120)
+    target_model: str | None = Field(default=None, min_length=1, max_length=120)
+    upstream_base: str | None = None
+    api_key: str | None = None
+    priority: int | None = Field(default=None, ge=0, le=100000)
+    enabled: bool | None = None
+    input_price_per_million: float | None = Field(default=None, ge=0, le=10**6)
+    output_price_per_million: float | None = Field(default=None, ge=0, le=10**6)
+
+    @model_validator(mode="before")
+    @classmethod
+    def non_secret_fields_cannot_be_null(cls, data):
+        if isinstance(data, dict):
+            for field, value in data.items():
+                if field in cls.model_fields and field != "api_key" and value is None:
+                    raise ValueError(f"{field} 不能为 null")
+        return data
+
+    @field_validator("name", "match_model", "target_model")
+    @classmethod
+    def optional_route_text_not_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("不能为空")
+        return value
+
+    @field_validator("upstream_base")
+    @classmethod
+    def optional_route_http_url(cls, value: str | None) -> str | None:
+        return http_url(value) if value is not None else None

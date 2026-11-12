@@ -4,18 +4,15 @@ services:
       context: .
       dockerfile: deploy/backend.Dockerfile
     environment:
-      DEFAULT_UPSTREAM_BASE: ${DEFAULT_UPSTREAM_BASE:-https://api.openai.com/v1}
-      DEFAULT_MCP_UPSTREAM: ${DEFAULT_MCP_UPSTREAM:-}
+      AGENTTRACE_ENV_FILE: /data/.env
+      AGENTTRACE_BOOTSTRAP_ENV: /run/agenttrace/bootstrap.env
       DB_URL: sqlite:////data/agenttrace.db
-      ENABLE_LLM_CHECK: ${ENABLE_LLM_CHECK:-false}
-      CHECK_MODEL_BASE: ${CHECK_MODEL_BASE:-https://api.openai.com/v1}
-      CHECK_MODEL_KEY: ${CHECK_MODEL_KEY:-}
-      CHECK_MODEL_NAME: ${CHECK_MODEL_NAME:-gpt-4o-mini}
       ADMIN_KEY: ${ADMIN_KEY:-}
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
       - ./data:/data
+      - ./.env:/run/agenttrace/bootstrap.env:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"]
       interval: 5s

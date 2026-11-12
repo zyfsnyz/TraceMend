@@ -74,6 +74,17 @@ python scripts/e2e_smoke.py --cleanup
 4. 浏览器详情页已实际显示 `llm` 来源、严重度、标题、解释和证据；Markdown 与 PDF 报告均包含该 LLM Finding，PDF 通过 `pdftotext` 复核。
 5. 检测响应与 Trace 详情中未出现 `Authorization` 或 `CHECK_MODEL_KEY`。本地证据保存在被 Git 忽略的 `artifacts/llm-live-verification.json`、`artifacts/llm-live-check.png` 和对应报告中。
 
+### 网页配置与轻量网关验收（2026-11-12）
+
+- 后端 `pytest`：**132 项通过**；`ruff check .` 通过。
+- 前端：**18 个测试文件、53 项测试通过**；ESLint、TypeScript 类型检查通过；生产构建通过，1629 个模块完成转换。
+- 浏览器实际保存默认模型 `agnes-3.0-flash`，刷新后配置仍存在；创建“浏览器验收路由”，完成停用、重新启用和删除，验收路由已清理。
+- 使用已保存的 Agnes 检测模型配置执行真实“保存并测试连接”，页面返回“模型连接成功：agnes-3.0-flash”；未读取或输出密钥。
+- 总览显示估算成本与设置入口；接入指南显示“先配置连接”、简化 SDK 示例和同源 `/mcp` 地址。1440px 视口无横向溢出。
+- 新增回归验证：默认上游与 MCP 密钥不会发送给显式自定义上游；显式上游绕过每日预算；路由 SSE 原字节透传并记录路由与 Token；保存配置不会回显密钥；Compose 持久配置覆盖初始配置。
+- 修改后的 Compose YAML 已重新解析通过；`netstat` 确认当前 3000/8000 服务均只监听 `127.0.0.1`。
+- 再次执行 `scripts/e2e_smoke.py --cleanup`，非流式、SSE、MCP、SQLite 落库、Markdown/PDF 和清理全部通过。
+
 ### 未执行项
 
 - 本机没有安装 Docker，未实际执行容器构建和 `docker compose up`。已验证 Compose YAML 可解析、服务端口映射为 `127.0.0.1`，但容器运行时仍需在安装 Docker 的环境复验。

@@ -17,6 +17,7 @@ export interface Trace {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  estimated_cost_usd?: number;
   tags: string[];
   metadata: Record<string, JsonValue>;
   error: string | null;
@@ -86,9 +87,75 @@ export interface Stats {
   risk_traces: number;
   total_findings: number;
   total_tokens: number;
+  total_cost_usd?: number;
+  today_tokens?: number;
+  daily_token_budget?: number;
+  active_routes?: number;
+  open_circuits?: number;
   avg_duration_ms: number;
   tool_calls: number;
   models: Record<string, number>;
   daily: DailyStat[];
   recent_traces?: Trace[];
 }
+
+export interface AppSettings {
+  default_upstream_base: string;
+  default_upstream_model: string;
+  default_upstream_key_configured: boolean;
+  default_mcp_upstream: string;
+  default_mcp_key_configured: boolean;
+  enable_llm_check: boolean;
+  check_model_base: string;
+  check_model_key_configured: boolean;
+  check_model_name: string;
+  check_model_timeout: number;
+  gateway_daily_token_budget: number;
+  gateway_failure_threshold: number;
+  gateway_cooldown_seconds: number;
+  default_input_price_per_million: number;
+  default_output_price_per_million: number;
+}
+
+export type SettingsUpdate = Partial<Omit<AppSettings,
+  'default_upstream_key_configured' | 'default_mcp_key_configured' | 'check_model_key_configured'
+>> & {
+  default_upstream_key?: string;
+  default_mcp_key?: string;
+  check_model_key?: string;
+};
+
+export interface CircuitState {
+  status: 'closed' | 'open' | string;
+  failures: number;
+  open_remaining_seconds: number;
+}
+
+export interface GatewayRoute {
+  id: string;
+  name: string;
+  match_model: string;
+  target_model: string;
+  upstream_base: string;
+  api_key_configured: boolean;
+  priority: number;
+  enabled: boolean;
+  input_price_per_million: number;
+  output_price_per_million: number;
+  circuit: CircuitState;
+}
+
+export interface GatewayRouteInput {
+  name: string;
+  match_model: string;
+  target_model: string;
+  upstream_base: string;
+  api_key?: string;
+  priority: number;
+  enabled: boolean;
+  input_price_per_million: number;
+  output_price_per_million: number;
+}
+
+export type GatewayRouteUpdate = Partial<GatewayRouteInput>;
+export interface ConnectionTestResult { ok: boolean; kind: string; message: string; model?: string }

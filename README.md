@@ -7,6 +7,8 @@ AgentTrace 是一个中文、本地优先的 Agent 审计工作台：通过透�
 ## 功能
 
 - **OpenAI 兼容代理**：`/v1/chat/completions` 非流式与 SSE 流式转发，保留上游状态码和响应，记录消息、工具调用、内容、Token、模型和异常。
+- **网页连接设置**：在“连接设置”中配置默认模型、MCP 与二阶检测模型，保存后立即生效；密钥只写入被 Git 忽略的本地 `.env`，API 不回显。
+- **轻量模型网关**：按模型名称和通配符匹配多条上游规则，支持优先级、408/425/429/5xx/网络错误自动切换、连续失败熔断、每日 Token 预算和按配置价格估算 USD 成本。
 - **MCP 代理**：转发 JSON-RPC，记录 `initialize`、`tools/list`、`tools/call` 及工具结果或错误。
 - **框架无关接入**：自定义 Agent 可直接 `POST /api/traces/ingest`，无需安装 AgentTrace SDK。
 - **免费规则检测**：工具异常、空工具结果、参数/schema 问题、同名同参数重复调用、声明来源但无来源证据、工具证据未支撑的数字、明确状态冲突。
@@ -24,6 +26,7 @@ Agent / OpenAI SDK / LangChain / MCP Client
                     ▼
         FastAPI 透明代理与 REST API
           ├─ Trace / Span 归一化
+          ├─ 模型路由 / 预算 / 熔断 / 成本估算
           ├─ 免费规则（默认独立可用）
           ├─ 二阶 LLM 检测（默认关闭）
           └─ SQLAlchemy + SQLite 本地持久化
@@ -51,7 +54,9 @@ docker compose up --build
 - 后端 API：<http://127.0.0.1:8000>
 - 健康检查：<http://127.0.0.1:8000/api/health>
 
-Compose 默认仅将端口绑定到 `127.0.0.1`。如需对外提供服务，必须显式修改 `ports` 绑定，并务必同时设置强 `ADMIN_KEY`、在入口启用 TLS、在可信网关或网络层配置上游地址白名单及代理客户端访问控制。**设置 `ADMIN_KEY` 不会保护 `/v1` 和 `/mcp`**：这两个协议代理无论是否设置管理密钥，都必须由反向代理、网关鉴权或网络 ACL 限制访问；应用也尚未实现上游地址白名单，不要将未鉴权代理直接暴露到公网。
+启动后可直接打开“连接设置”网页配置模型与 MCP；非敏感的网关策略保存在 SQLite，密钥写入本地 `.env` 并立即生效。也可继续手动编辑 `.env`。
+
+Compose 默认仅将端口绑定到 `127.0.0.1`。网页保存的连接配置写入持久化的 `data/.env`，初始 `.env` 以只读方式挂载；`data/.env` 中的同名配置在重启后优先，`ADMIN_KEY` 仍由 Compose 环境显式管理。`data/` 已被 Git 忽略。如需对外提供服务，必须显式修改 `ports` 绑定，并务必同时设置强 `ADMIN_KEY`、在入口启用 TLS、在可信网关或网络层配置上游地址白名单及代理客户端访问控制。**设置 `ADMIN_KEY` 不会保护 `/v1` 和 `/mcp`**：这两个协议代理无论是否设置管理密钥，都必须由反向代理、网关鉴权或网络 ACL 限制访问；应用也尚未实现上游地址白名单，不要将未鉴权代理直接暴露到公网。
 
 前端 Nginx 通过 `client_max_body_size 20m` 将经前端代理的请求体上限设为 20 MiB，超限请求会由 Nginx 拒绝；直接访问后端端口不经过这一前端代理限制。
 
@@ -103,7 +108,15 @@ python scripts/seed_demo.py
 | 变量 | 默认值 | 用途 |
 |---|---|---|
 | `DEFAULT_UPSTREAM_BASE` | `https://api.openai.com/v1` | OpenAI 兼容代理的默认上游 |
+| `DEFAULT_UPSTREAM_MODEL` | 空 | 请求未提供模型时使用的默认模型 |
+| `DEFAULT_UPSTREAM_KEY` | 空 | 客户端未提供 Authorization 或使用保留占位 `agenttrace` 时使用的默认上游密钥；显式直连不替换 |
 | `DEFAULT_MCP_UPSTREAM` | 空 | 默认完整 MCP URL；也可逐请求覆盖 |
+| `DEFAULT_MCP_KEY` | 空 | 客户端未提供 Authorization 时使用的 MCP 密钥 |
+| `GATEWAY_DAILY_TOKEN_BUDGET` | `0` | OpenAI 代理每日 Token 软预算；按已落库用量检查，不做并发预留；0 不限 |
+| `GATEWAY_FAILURE_THRESHOLD` | `2` | 路由连续失败熔断阈值 |
+| `GATEWAY_COOLDOWN_SECONDS` | `30` | 熔断冷却秒数 |
+| `DEFAULT_INPUT_PRICE_PER_MILLION` | `0` | 默认上游每百万输入 Token 的估算 USD 价格 |
+| `DEFAULT_OUTPUT_PRICE_PER_MILLION` | `0` | 默认上游每百万输出 Token 的估算 USD 价格 |
 | `DB_URL` | `sqlite:///./data/agenttrace.db` | SQLAlchemy 数据库 URL；Compose 固定使用 `/data` |
 | `ENABLE_LLM_CHECK` | `false` | 是否允许二阶 LLM 检测，默认关闭 |
 | `CHECK_MODEL_BASE` | `https://api.openai.com/v1` | 可选检测模型的 OpenAI 兼容 base URL |
@@ -113,6 +126,17 @@ python scripts/seed_demo.py
 | `ADMIN_KEY` | 空 | 设置后，除健康检查外的 `/api/*` 需要 `X-Admin-Key`；只能使用 ASCII 字符 |
 
 `.env` 被 Git 忽略，`.env.example` 不含真实密钥。
+
+### 网页配置与轻量网关
+
+“连接设置”页集中管理默认模型、MCP、二阶检测、路由和成本。路由按 `fnmatch` 模型通配符匹配，数字优先级越小越先尝试；请求显式携带 `X-Upstream-Base` 时保持旧行为，不经过网关路由、预算和熔断。
+
+- 对 408、425、429、5xx 和网络错误尝试下一路由；其他 4xx（含 400、401、403、404）不重试。连续失败达到阈值后临时熔断，可在网页手动重置。
+- `Authorization` 转发：路由配置了 `api_key` 时使用该密钥并覆盖客户端 `Authorization`；路由未配置密钥时原样透传客户端密钥。`DEFAULT_UPSTREAM_KEY` 只作用于默认上游，且仅当客户端未提供 `Authorization` 或使用保留占位 `agenttrace` 时替换；显式 `X-Upstream-Base` 直连始终原样透传，不注入服务端密钥。
+- 每日预算只统计当天 `openai-proxy` Trace 的 `total_tokens`；超出后返回 429。设为 0 表示不限。
+- 成本按实际 usage 与配置的每百万 Token USD 单价估算；未配置价格或上游未返回 usage 时不产生可靠成本值。
+- 流式响应在收到上游响应头前可切换路由；开始向客户端发送 SSE 后不再重试，以免拼接受损响应。
+- 当前不包含相同 Prompt 缓存、多用户 Quota 或完整 LiteLLM 协议适配。
 
 ## 接入
 
@@ -214,7 +238,7 @@ curl -X POST http://127.0.0.1:8000/api/traces/ingest \
 ## 数据隐私与安全边界
 
 - Trace、prompt、模型输出、工具参数、工具结果、Finding 和评论默认保存在本地 SQLite；这些数据本身可能含敏感信息，请按日志级别保护 `./data` 和导出报告。
-- 上游 `Authorization` 只用于当次代理转发，不作为审计内容写入数据库；`X-Admin-Key` 也不会转发给上游。代理 API key 与 `CHECK_MODEL_KEY` 不得提交到 Git。
+- 上游与 MCP `Authorization` 只用于当次代理转发，不作为审计内容写入数据库；`X-Admin-Key` 也不会转发给上游。网页和路由密钥保存在被 Git 忽略的 `.env`（Compose 为 `data/.env`），接口只返回“是否已配置”，不会回显密钥。
 - `X-Upstream-Base` 和 `X-MCP-Upstream` 能把数据发送到指定服务。只允许可信客户端访问代理，部署到共享环境时应增加网络访问控制、TLS 和上游地址白名单。
 - `ADMIN_KEY` 保护管理 API，不是上游 API key，也不替代公网身份认证方案。`ADMIN_KEY` 只能使用 ASCII 字符（HTTP 请求头限制），非 ASCII 配置会在启动时直接报错。前端收到 401 会自动打开“管理密钥设置”，验证后只把密钥保存在当前标签页的 `sessionStorage`，并在 API 请求和报告下载中附带 `X-Admin-Key`。
 - `ADMIN_KEY` **不保护** `/v1` 与 `/mcp` 协议代理；这两个入口需要由反向代理、网络 ACL 或网关鉴权限制访问。
@@ -239,7 +263,15 @@ curl -X POST http://127.0.0.1:8000/api/traces/ingest \
 | `POST /api/traces/{id}/llm-check` | 显式执行可选二阶 LLM 检测；未启用/未配置返回 409 |
 | `GET /api/traces/{id}/report.md` | 下载 Markdown 报告 |
 | `GET /api/traces/{id}/report.pdf` | 下载 PDF 报告 |
-| `GET /api/stats?days=30` | Trace、错误、风险、Token、耗时和模型统计 |
+| `GET /api/stats?days=30` | Trace、错误、风险、Token、耗时、模型、成本与预算统计 |
+| `GET /api/settings` | 读取网页连接设置；只返回密钥是否已配置 |
+| `PUT /api/settings` | 保存连接、预算、熔断与价格配置并立即刷新运行时 |
+| `POST /api/settings/test` | 测试 OpenAI、检测模型或 MCP 连接 |
+| `GET /api/gateway/routes` | 读取模型路由及熔断状态 |
+| `POST /api/gateway/routes` | 创建模型匹配与上游路由 |
+| `PATCH /api/gateway/routes/{id}` | 更新路由、价格、优先级或启用状态 |
+| `DELETE /api/gateway/routes/{id}` | 删除路由并清除其独立密钥变量 |
+| `POST /api/gateway/routes/{id}/reset` | 手动重置熔断状态 |
 | `POST /v1/chat/completions` | OpenAI 兼容非流式/SSE 透明代理 |
 | `POST /mcp`、`POST /mcp/{path}` | MCP JSON-RPC 透明代理 |
 
@@ -292,6 +324,8 @@ python scripts/e2e_smoke.py --cleanup
 本机已执行的测试、浏览器验收、Hermes 接入和未执行项记录在 [`docs/verification.md`](docs/verification.md)。
 
 ## 路线图
+
+- 相同请求缓存、按用户/API Key 配额与更细粒度的路由策略。
 
 - 更多 Agent 框架的一键适配与 OpenTelemetry 导入。
 - 可配置上游白名单、保留周期和审计数据脱敏策略。

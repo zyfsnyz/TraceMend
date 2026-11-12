@@ -1,5 +1,8 @@
 import { getAdminKey, UNAUTHORIZED_EVENT } from '../lib/adminKey';
-import type { Comment, Stats, TraceDetail, TraceFilters, TraceListResponse } from './types';
+import type {
+  AppSettings, Comment, ConnectionTestResult, GatewayRoute, GatewayRouteInput,
+  GatewayRouteUpdate, SettingsUpdate, Stats, TraceDetail, TraceFilters, TraceListResponse,
+} from './types';
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number) {
@@ -76,6 +79,38 @@ export function reanalyzeTrace(id: string): Promise<unknown> {
 
 export function llmCheckTrace(id: string): Promise<unknown> {
   return apiFetch(`/api/traces/${encodeURIComponent(id)}/llm-check`, { method: 'POST' });
+}
+
+export function getSettings(): Promise<AppSettings> {
+  return apiFetch<AppSettings>('/api/settings');
+}
+
+export function saveSettings(payload: SettingsUpdate): Promise<AppSettings> {
+  return apiFetch<AppSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(payload) });
+}
+
+export function testConnection(kind: 'openai' | 'check' | 'mcp'): Promise<ConnectionTestResult> {
+  return apiFetch<ConnectionTestResult>('/api/settings/test', { method: 'POST', body: JSON.stringify({ kind }) });
+}
+
+export function getGatewayRoutes(): Promise<{ items: GatewayRoute[] }> {
+  return apiFetch<{ items: GatewayRoute[] }>('/api/gateway/routes');
+}
+
+export function createGatewayRoute(payload: GatewayRouteInput): Promise<GatewayRoute> {
+  return apiFetch<GatewayRoute>('/api/gateway/routes', { method: 'POST', body: JSON.stringify(payload) });
+}
+
+export function updateGatewayRoute(id: string, payload: GatewayRouteUpdate): Promise<GatewayRoute> {
+  return apiFetch<GatewayRoute>(`/api/gateway/routes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) });
+}
+
+export function deleteGatewayRoute(id: string): Promise<void> {
+  return apiFetch<void>(`/api/gateway/routes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export function resetGatewayRoute(id: string): Promise<GatewayRoute> {
+  return apiFetch<GatewayRoute>(`/api/gateway/routes/${encodeURIComponent(id)}/reset`, { method: 'POST' });
 }
 
 export async function downloadReport(id: string, format: 'md' | 'pdf'): Promise<void> {

@@ -1,12 +1,16 @@
 import json
+from contextlib import suppress
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import anyio
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from sqlalchemy import func, select
 
 from .audit import make_span
+from .gateway import gateway_metadata, load_candidates
 from .models import Trace
 from .rules import run_rules
 from .schemas import SpanIn
@@ -68,6 +72,7 @@ def persist_openai_trace(
     started_at: datetime,
     ended_at: datetime,
     error=None,
+    gateway: dict | None = None,
 ) -> None:
     invocation_id = uuid4().hex
     span_prefix = f"{trace_id}-{invocation_id}"
@@ -198,6 +203,22 @@ def persist_openai_trace(
         )
         trace.total_tokens = (trace.total_tokens or 0) + usage.get("total_tokens", 0)
         trace.error = error if error is not None else trace.error
+        if gateway is not None:
+            previous_gateway = (trace.metadata_json or {}).get("gateway", {})
+            previous_cost = (
+                previous_gateway.get("cost_usd", 0)
+                if isinstance(previous_gateway, dict)
+                else 0
+            )
+            if not isinstance(previous_cost, (int, float)) or isinstance(previous_cost, bool):
+                previous_cost = 0
+            current_cost = gateway.get("cost_usd", 0)
+            gateway = {
+                **gateway,
+                "last_cost_usd": current_cost,
+                "cost_usd": round(previous_cost + current_cost, 10),
+            }
+            trace.metadata_json = {**(trace.metadata_json or {}), "gateway": gateway}
 
         trace_started = trace.started_at or started_at
         if trace_started.tzinfo is None:
@@ -324,6 +345,11 @@ async def relay_sse(
     trace_id: str,
     payload: dict,
     started_at: datetime,
+    candidate=None,
+    settings=None,
+    requested_model=None,
+    attempts=None,
+    circuits=None,
 ):
     accumulator = SSEAccumulator()
     error = None
@@ -334,20 +360,61 @@ async def relay_sse(
         accumulator.finish()
     except Exception as exc:
         error = {"type": type(exc).__name__, "message": str(exc)}
+    except BaseException as exc:
+        error = {"type": type(exc).__name__, "message": str(exc)}
+        raise
     finally:
-        ended_at = datetime.now(UTC)
-        persist_openai_trace(
-            session_factory,
-            trace_id,
-            payload,
-            accumulator.output(payload),
-            "completed" if error is None and accumulator.done else "failed",
-            started_at,
-            ended_at,
-            error,
-        )
-        await upstream.aclose()
-        await client.aclose()
+        with anyio.CancelScope(shield=True):
+            try:
+                try:
+                    ended_at = datetime.now(UTC)
+                    output = accumulator.output(payload)
+                    if (
+                        candidate is not None
+                        and not candidate.explicit
+                        and settings is not None
+                        and circuits is not None
+                    ):
+                        completed = error is None and accumulator.done
+                        if completed:
+                            circuits.record_success(candidate.circuit_key)
+                        else:
+                            circuits.record_failure(
+                                candidate.circuit_key,
+                                settings.gateway_failure_threshold,
+                                settings.gateway_cooldown_seconds,
+                            )
+                        if attempts is not None:
+                            attempt = {
+                                **attempt_info(candidate),
+                                "outcome": "success" if completed else "error",
+                                "status_code": upstream.status_code,
+                            }
+                            if error is not None:
+                                attempt["error_type"] = error["type"]
+                            attempts.append(attempt)
+                    gateway = (
+                        gateway_metadata(
+                            candidate, settings, requested_model, attempts or [], output
+                        )
+                        if candidate is not None and not candidate.explicit and settings is not None
+                        else None
+                    )
+                    persist_openai_trace(
+                        session_factory,
+                        trace_id,
+                        payload,
+                        output,
+                        "completed" if error is None and accumulator.done else "failed",
+                        started_at,
+                        ended_at,
+                        error,
+                        gateway,
+                    )
+                finally:
+                    await upstream.aclose()
+            finally:
+                await client.aclose()
 
 
 def network_failure_response(
@@ -356,6 +423,7 @@ def network_failure_response(
     payload: dict,
     started_at: datetime,
     exc: httpx.HTTPError,
+    gateway: dict | None = None,
 ) -> JSONResponse:
     error = {"type": type(exc).__name__, "message": str(exc)}
     persist_openai_trace(
@@ -367,6 +435,7 @@ def network_failure_response(
         started_at,
         datetime.now(UTC),
         error,
+        gateway,
     )
     return JSONResponse(
         status_code=502,
@@ -375,98 +444,287 @@ def network_failure_response(
     )
 
 
+def retryable_upstream(status_code: int) -> bool:
+    return status_code in {408, 425, 429} or status_code >= 500
+
+
+def candidate_headers(request: Request, candidate, settings) -> dict[str, str]:
+    headers = forward_request_headers(request)
+    authorization = next(
+        (value for key, value in headers.items() if key.lower() == "authorization"),
+        None,
+    )
+    use_default_key = not getattr(candidate, "explicit", False) and (
+        authorization is None or authorization == "Bearer agenttrace"
+    )
+    if candidate.api_key and (candidate.route is not None or use_default_key):
+        for key in list(headers):
+            if key.lower() == "authorization":
+                headers.pop(key)
+        headers["Authorization"] = f"Bearer {candidate.api_key}"
+    headers.setdefault("Content-Type", "application/json")
+    return headers
+
+
+def attempt_info(candidate) -> dict:
+    return {
+        "route_id": candidate.route.id if candidate.route else None,
+        "route_name": candidate.route.name if candidate.route else "默认上游",
+        "target_model": candidate.target_model,
+    }
+
+
+def response_json(content: bytes) -> object:
+    try:
+        return json.loads(content)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"content": content.decode(errors="replace")}
+
+
+def daily_token_usage(session_factory) -> int:
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    with session_factory() as session:
+        return int(
+            session.scalar(
+                select(func.sum(Trace.total_tokens)).where(
+                    Trace.source == "openai-proxy",
+                    func.coalesce(Trace.started_at, Trace.created_at) >= today,
+                )
+            )
+            or 0
+        )
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     payload = await request_json_object(request)
     trace_id = request.headers.get("X-AgentTrace-Id", str(uuid4()))
-    upstream_base = request.headers.get(
-        "X-Upstream-Base", request.app.state.settings.default_upstream_base
-    )
     started_at = datetime.now(UTC)
-    body = await request.body()
-    if payload.get("stream"):
-        client = httpx.AsyncClient(timeout=60)
-        upstream_request = client.build_request(
-            "POST",
-            f"{upstream_base.rstrip('/')}/chat/completions",
-            content=body,
-            headers=forward_request_headers(request),
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+    budget = settings.gateway_daily_token_budget
+    if (
+        not request.headers.get("X-Upstream-Base")
+        and budget
+        and daily_token_usage(session_factory) >= budget
+    ):
+        error = {"type": "DailyTokenBudgetExceeded", "message": "每日 Token 预算已用尽"}
+        persist_openai_trace(
+            session_factory,
+            trace_id,
+            payload,
+            None,
+            "failed",
+            started_at,
+            datetime.now(UTC),
+            error,
         )
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "每日 Token 预算已用尽，请调整预算或明日再试"},
+            headers={"X-AgentTrace-Id": trace_id},
+        )
+
+    requested_model = payload.get("model")
+    with session_factory() as session:
+        candidates = load_candidates(
+            session,
+            settings,
+            request.app.state.env_path,
+            requested_model,
+            request.headers.get("X-Upstream-Base"),
+        )
+    attempts = []
+    stream = bool(payload.get("stream"))
+    for index, candidate in enumerate(candidates):
+        info = attempt_info(candidate)
+        if not candidate.explicit and request.app.state.circuits.is_open(candidate.circuit_key):
+            attempts.append({**info, "outcome": "circuit_open"})
+            continue
+        attempt_payload = dict(payload)
+        if candidate.target_model:
+            attempt_payload["model"] = candidate.target_model
+        body = json.dumps(attempt_payload, ensure_ascii=False).encode("utf-8")
+        headers = candidate_headers(request, candidate, settings)
+        url = f"{candidate.upstream_base.rstrip('/')}/chat/completions"
+        client = httpx.AsyncClient(timeout=60)
+        upstream = None
+        content = b""
         try:
-            upstream = await client.send(upstream_request, stream=True)
+            if stream:
+                upstream_request = client.build_request(
+                    "POST", url, content=body, headers=headers
+                )
+                upstream = await client.send(upstream_request, stream=True)
+            else:
+                upstream = await client.post(url, content=body, headers=headers)
+            if not upstream.is_success:
+                content = await upstream.aread()
         except httpx.HTTPError as exc:
-            await client.aclose()
+            with anyio.CancelScope(shield=True):
+                try:
+                    if upstream is not None:
+                        with suppress(Exception):
+                            await upstream.aclose()
+                finally:
+                    with suppress(Exception):
+                        await client.aclose()
+            if not candidate.explicit:
+                request.app.state.circuits.record_failure(
+                    candidate.circuit_key,
+                    settings.gateway_failure_threshold,
+                    settings.gateway_cooldown_seconds,
+                )
+            has_next = index + 1 < len(candidates)
+            attempts.append(
+                {
+                    **info,
+                    "outcome": "retry" if has_next else "error",
+                    "error_type": type(exc).__name__,
+                }
+            )
+            if has_next:
+                continue
+            gateway = (
+                None
+                if candidate.explicit
+                else gateway_metadata(candidate, settings, requested_model, attempts, None)
+            )
             return network_failure_response(
-                request.app.state.session_factory, trace_id, payload, started_at, exc
-            )
-        if not upstream.is_success:
-            content = await upstream.aread()
-            try:
-                output = json.loads(content)
-            except json.JSONDecodeError:
-                output = {"content": content.decode(errors="replace")}
-            persist_openai_trace(
-                request.app.state.session_factory,
+                session_factory,
                 trace_id,
-                payload,
-                output,
-                "failed",
+                attempt_payload,
                 started_at,
-                datetime.now(UTC),
-                {"status_code": upstream.status_code, "body": output},
+                exc,
+                gateway,
             )
-            headers = forward_response_headers(upstream.headers, trace_id, decoded=True)
+
+        if upstream.is_success:
+            if not stream:
+                if not candidate.explicit:
+                    request.app.state.circuits.record_success(candidate.circuit_key)
+                attempts.append(
+                    {**info, "outcome": "success", "status_code": upstream.status_code}
+                )
+            if stream:
+                response_headers = forward_response_headers(upstream.headers, trace_id)
+                if candidate.route:
+                    response_headers["X-AgentTrace-Route-Id"] = candidate.route.id
+                return StreamingResponse(
+                    relay_sse(
+                        upstream,
+                        client,
+                        session_factory,
+                        trace_id,
+                        attempt_payload,
+                        started_at,
+                        candidate,
+                        settings,
+                        requested_model,
+                        attempts,
+                        request.app.state.circuits,
+                    ),
+                    status_code=upstream.status_code,
+                    headers=response_headers,
+                    media_type=upstream.headers.get("content-type"),
+                )
+            content = upstream.content
+            output = response_json(content)
+            response_headers = forward_response_headers(
+                upstream.headers, trace_id, decoded=True
+            )
             media_type = upstream.headers.get("content-type")
+            status_code = upstream.status_code
             await upstream.aclose()
             await client.aclose()
+            gateway = (
+                None
+                if candidate.explicit
+                else gateway_metadata(candidate, settings, requested_model, attempts, output)
+            )
+            persist_openai_trace(
+                session_factory,
+                trace_id,
+                attempt_payload,
+                output,
+                "completed",
+                started_at,
+                datetime.now(UTC),
+                gateway=gateway,
+            )
+            if candidate.route:
+                response_headers["X-AgentTrace-Route-Id"] = candidate.route.id
             return Response(
                 content=content,
-                status_code=upstream.status_code,
-                headers=headers,
+                status_code=status_code,
+                headers=response_headers,
                 media_type=media_type,
             )
-        return StreamingResponse(
-            relay_sse(
-                upstream,
-                client,
-                request.app.state.session_factory,
-                trace_id,
-                payload,
-                started_at,
-            ),
-            status_code=upstream.status_code,
-            headers=forward_response_headers(upstream.headers, trace_id),
-            media_type=upstream.headers.get("content-type"),
-        )
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            upstream = await client.post(
-                f"{upstream_base.rstrip('/')}/chat/completions",
-                content=body,
-                headers=forward_request_headers(request),
+
+        output = response_json(content)
+        status_code = upstream.status_code
+        response_headers = forward_response_headers(upstream.headers, trace_id, decoded=True)
+        media_type = upstream.headers.get("content-type")
+        await upstream.aclose()
+        await client.aclose()
+        retryable = retryable_upstream(status_code)
+        if retryable and not candidate.explicit:
+            request.app.state.circuits.record_failure(
+                candidate.circuit_key,
+                settings.gateway_failure_threshold,
+                settings.gateway_cooldown_seconds,
             )
-    except httpx.HTTPError as exc:
-        return network_failure_response(
-            request.app.state.session_factory, trace_id, payload, started_at, exc
+        has_next = retryable and index + 1 < len(candidates)
+        attempts.append(
+            {
+                **info,
+                "outcome": "retry" if has_next else "error",
+                "status_code": status_code,
+            }
         )
-    try:
-        output = upstream.json()
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        output = {"content": upstream.content.decode(errors="replace")}
-    ended_at = datetime.now(UTC)
+        if has_next:
+            continue
+        if candidate.route:
+            response_headers["X-AgentTrace-Route-Id"] = candidate.route.id
+        gateway = (
+            None
+            if candidate.explicit
+            else gateway_metadata(candidate, settings, requested_model, attempts, output)
+        )
+        persist_openai_trace(
+            session_factory,
+            trace_id,
+            attempt_payload,
+            output,
+            "failed",
+            started_at,
+            datetime.now(UTC),
+            {"status_code": status_code, "body": output},
+            gateway,
+        )
+        return Response(
+            content=content,
+            status_code=status_code,
+            headers=response_headers,
+            media_type=media_type,
+        )
+
+    candidate = candidates[0]
+    error = {"type": "CircuitOpen", "message": "所有匹配路由均处于熔断冷却期"}
+    gateway = gateway_metadata(candidate, settings, requested_model, attempts, None)
     persist_openai_trace(
-        request.app.state.session_factory,
+        session_factory,
         trace_id,
         payload,
-        output,
-        "completed" if upstream.is_success else "failed",
+        None,
+        "failed",
         started_at,
-        ended_at,
-        None if upstream.is_success else {"status_code": upstream.status_code, "body": output},
+        datetime.now(UTC),
+        error,
+        gateway,
     )
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=forward_response_headers(upstream.headers, trace_id, decoded=True),
-        media_type=upstream.headers.get("content-type"),
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "所有匹配路由均处于熔断冷却期，请稍后重试或手动复位"},
+        headers={"X-AgentTrace-Id": trace_id},
     )

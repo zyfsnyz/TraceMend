@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { apiFetch, ApiError, createComment, downloadReport, getTraces, llmCheckTrace, patchComment } from './client';
+import { apiFetch, ApiError, createComment, createGatewayRoute, downloadReport, getSettings, getTraces, llmCheckTrace, patchComment, saveSettings } from './client';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -166,5 +166,42 @@ describe('管理密钥请求头', () => {
     expect(fetchMock.mock.calls[0][1].headers.get('X-Admin-Key')).toBe('local-admin');
     expect(unauthorized).toHaveBeenCalledTimes(1);
     window.removeEventListener('agenttrace:unauthorized', unauthorized);
+  });
+});
+
+describe('网页设置与模型网关 API', () => {
+  function mockJson(body: unknown, status = 200) {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
+      status, headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('设置读取与保存使用正确端点，密钥只出现在用户主动提交的 PUT 中', async () => {
+    const settings = { default_upstream_base: 'https://api.deepseek.com/v1' };
+    const getMock = mockJson(settings);
+    await getSettings();
+    expect(getMock).toHaveBeenCalledWith('/api/settings', expect.anything());
+
+    const putMock = mockJson(settings);
+    await saveSettings({ default_upstream_base: 'https://api.deepseek.com/v1', default_upstream_key: 'new-secret' });
+    const options = putMock.mock.calls[0][1];
+    expect(putMock.mock.calls[0][0]).toBe('/api/settings');
+    expect(options.method).toBe('PUT');
+    expect(JSON.parse(options.body)).toEqual({ default_upstream_base: 'https://api.deepseek.com/v1', default_upstream_key: 'new-secret' });
+  });
+
+  it('创建路由使用写字段 api_key，并保留优先级与价格', async () => {
+    const fetchMock = mockJson({ id: 'route-1' }, 201);
+    const payload = {
+      name: '主路由', match_model: 'gpt-*', target_model: 'deepseek-chat',
+      upstream_base: 'https://api.deepseek.com/v1', api_key: 'route-secret', priority: 10,
+      enabled: true, input_price_per_million: 0.5, output_price_per_million: 1.5,
+    };
+    await createGatewayRoute(payload);
+    expect(fetchMock).toHaveBeenCalledWith('/api/gateway/routes', expect.objectContaining({
+      method: 'POST', body: JSON.stringify(payload),
+    }));
   });
 });

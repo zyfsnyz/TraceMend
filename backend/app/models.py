@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -121,3 +121,22 @@ class Comment(Base):
 
     trace: Mapped[Trace] = relationship(back_populates="comments")
     span: Mapped[Span | None] = relationship(back_populates="comments")
+
+
+class GatewayRoute(Base):
+    __tablename__ = "gateway_routes"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    match_model: Mapped[str] = mapped_column(String, index=True)
+    target_model: Mapped[str] = mapped_column(String)
+    upstream_base: Mapped[str] = mapped_column(String)
+    key_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, default=100, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    input_price_per_million: Mapped[float] = mapped_column(Float, default=0)
+    output_price_per_million: Mapped[float] = mapped_column(Float, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )

@@ -5,12 +5,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from . import models  # noqa: F401
+from . import config, models  # noqa: F401
 from .api import router
-from .config import Settings
 from .db import Base, make_engine, make_session_factory
+from .gateway import CircuitRegistry
+from .gateway_api import router as gateway_router
 from .mcp import router as mcp_router
 from .proxy import router as proxy_router
+from .settings_api import router as settings_router
 
 
 def admin_key_matches(candidate: str, expected: str) -> bool:
@@ -19,33 +21,39 @@ def admin_key_matches(candidate: str, expected: str) -> bool:
 
 
 def create_app() -> FastAPI:
-    settings = Settings()
+    settings = config.Settings(_env_file=config.env_files())
     engine = make_engine(settings.db_url)
     Base.metadata.create_all(engine)
-    application = FastAPI(title="AgentTrace", version="0.1.0")
+    application = FastAPI(title="AgentTrace", version="0.2.0")
     application.state.settings = settings
+    application.state.env_path = config.PROJECT_ENV
+    application.state.bootstrap_env_path = config.BOOTSTRAP_ENV
     application.state.engine = engine
     application.state.session_factory = make_session_factory(engine)
+    application.state.circuits = CircuitRegistry()
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000"],
+        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
     application.include_router(router)
+    application.include_router(settings_router)
+    application.include_router(gateway_router)
     application.include_router(proxy_router)
     application.include_router(mcp_router)
 
     @application.middleware("http")
     async def admin_auth(request: Request, call_next):
+        current_settings = request.app.state.settings
         if (
-            settings.admin_key
+            current_settings.admin_key
             and request.url.path.startswith("/api/")
             and request.url.path != "/api/health"
             and request.method != "OPTIONS"
             and not admin_key_matches(
-                request.headers.get("X-Admin-Key", ""), settings.admin_key
+                request.headers.get("X-Admin-Key", ""), current_settings.admin_key
             )
         ):
             return JSONResponse(status_code=401, content={"detail": "管理密钥无效"})

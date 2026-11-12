@@ -17,6 +17,7 @@ venv/
 artifacts/
 
 # OS / editors
+.hermes/
 .DS_Store
 Thumbs.db
 .idea/

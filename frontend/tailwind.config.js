@@ -12,7 +12,7 @@ export default {
         mono: ['"SFMono-Regular"', 'Consolas', '"Liberation Mono"', 'monospace'],
       },
       boxShadow: {
-        panel: '0 1px 2px rgba(16, 30, 54, .04), 0 8px 24px rgba(16, 30, 54, .035)',
+        panel: '0 1px 2px rgba(16, 30, 54, .035)',
         float: '0 16px 48px rgba(15, 27, 45, .16)',
       },
     },

@@ -11,7 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from .audit import ingest, load_detail
 from .llm_check import LLMCheckError, run_llm_check
-from .models import Comment, Finding, Span, Trace
+from .models import Comment, Finding, GatewayRoute, Span, Trace
 from .reports import render_markdown, render_pdf
 from .rules import run_rules
 from .schemas import CommentCreate, CommentPatch, IngestIn, TraceCommentIn
@@ -282,6 +282,26 @@ def get_stats(request: Request, days: int = Query(default=30, ge=1, le=3650)):
             (trace.started_at or trace.created_at).date().isoformat() for trace in traces
         )
         models = Counter(trace.model or "未知模型" for trace in traces)
+        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_tokens = int(
+            session.scalar(
+                select(func.sum(Trace.total_tokens)).where(
+                    Trace.source == "openai-proxy",
+                    func.coalesce(Trace.started_at, Trace.created_at) >= today,
+                )
+            )
+            or 0
+        )
+        costs = []
+        for trace in traces:
+            gateway = (trace.metadata_json or {}).get("gateway", {})
+            cost = gateway.get("cost_usd", 0) if isinstance(gateway, dict) else 0
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                costs.append(cost)
+        routes = session.scalars(select(GatewayRoute)).all()
+        open_circuits = sum(
+            request.app.state.circuits.is_open(route.id) for route in routes
+        )
         return {
             "total_traces": len(traces),
             "completed_traces": sum(trace.status == "completed" for trace in traces),
@@ -289,6 +309,11 @@ def get_stats(request: Request, days: int = Query(default=30, ge=1, le=3650)):
             "risk_traces": sum(bool(trace.findings) for trace in traces),
             "total_findings": sum(len(trace.findings) for trace in traces),
             "total_tokens": sum(trace.total_tokens or 0 for trace in traces),
+            "total_cost_usd": round(sum(costs), 10),
+            "today_tokens": today_tokens,
+            "daily_token_budget": request.app.state.settings.gateway_daily_token_budget,
+            "active_routes": sum(route.enabled for route in routes),
+            "open_circuits": open_circuits,
             "avg_duration_ms": sum(durations) / len(durations) if durations else 0,
             "tool_calls": sum(span.kind == "tool" for trace in traces for span in trace.spans),
             "models": dict(models),

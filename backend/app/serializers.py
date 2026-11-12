@@ -15,6 +15,11 @@ def iso(value: datetime | None) -> str | None:
 def trace_dict(
     trace: Trace, span_count: int | None = None, risk_count: int | None = None
 ) -> dict[str, Any]:
+    metadata = trace.metadata_json or {}
+    gateway = metadata.get("gateway", {})
+    estimated_cost = gateway.get("cost_usd", 0) if isinstance(gateway, dict) else 0
+    if not isinstance(estimated_cost, (int, float)) or isinstance(estimated_cost, bool):
+        estimated_cost = 0
     return {
         "id": trace.id,
         "parent_id": trace.parent_id,
@@ -31,7 +36,8 @@ def trace_dict(
         "completion_tokens": trace.completion_tokens,
         "total_tokens": trace.total_tokens,
         "tags": trace.tags or [],
-        "metadata": trace.metadata_json or {},
+        "metadata": metadata,
+        "estimated_cost_usd": estimated_cost,
         "error": trace.error,
         "created_at": iso(trace.created_at),
         "span_count": len(trace.spans) if span_count is None else span_count,

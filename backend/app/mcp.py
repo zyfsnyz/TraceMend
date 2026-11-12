@@ -13,9 +13,14 @@ from .rules import run_rules
 router = APIRouter()
 
 
-def mcp_request_headers(request: Request) -> dict[str, str]:
+def mcp_request_headers(request: Request, default_key: str | None = None) -> dict[str, str]:
     excluded = HOP_BY_HOP | {"x-mcp-upstream", "x-agenttrace-id", "x-admin-key"}
-    return {key: value for key, value in request.headers.items() if key.lower() not in excluded}
+    headers = {
+        key: value for key, value in request.headers.items() if key.lower() not in excluded
+    }
+    if default_key and not any(key.lower() == "authorization" for key in headers):
+        headers["Authorization"] = f"Bearer {default_key}"
+    return headers
 
 
 def mcp_failure(output: object) -> object | None:
@@ -135,7 +140,12 @@ async def mcp_proxy(request: Request, path: str = ""):
             upstream = await client.post(
                 upstream_url,
                 content=body,
-                headers=mcp_request_headers(request),
+                headers=mcp_request_headers(
+                    request,
+                    request.app.state.settings.default_mcp_key
+                    if "x-mcp-upstream" not in request.headers
+                    else None,
+                ),
             )
     except httpx.HTTPError as exc:
         output = {"type": type(exc).__name__, "message": str(exc)}
