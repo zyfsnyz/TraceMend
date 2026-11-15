@@ -132,10 +132,10 @@ python scripts/seed_demo.py
 “连接设置”页集中管理默认模型、MCP、二阶检测、路由和成本。路由按 `fnmatch` 模型通配符匹配，数字优先级越小越先尝试；请求显式携带 `X-Upstream-Base` 时保持旧行为，不经过网关路由、预算和熔断。
 
 - 对 408、425、429、5xx 和网络错误尝试下一路由；其他 4xx（含 400、401、403、404）不重试。连续失败达到阈值后临时熔断，可在网页手动重置。
-- `Authorization` 转发：路由配置了 `api_key` 时使用该密钥并覆盖客户端 `Authorization`；路由未配置密钥时原样透传客户端密钥。`DEFAULT_UPSTREAM_KEY` 只作用于默认上游，且仅当客户端未提供 `Authorization` 或使用保留占位 `agenttrace` 时替换；显式 `X-Upstream-Base` 直连始终原样透传，不注入服务端密钥。
-- 每日预算只统计当天 `openai-proxy` Trace 的 `total_tokens`；超出后返回 429。设为 0 表示不限。
+- 认证头转发：路由配置了 `api_key` 时使用该密钥覆盖客户端 `Authorization`，并清除 `api-key`、`x-api-key`、Cookie、token/secret/signature 等其他客户端凭据头。只有首个候选路由可在未配置密钥时透传调用方凭据；故障切换到后续候选时一律清除这些凭据，备用路由需要自己的 `api_key`，避免跨服务商泄露。`DEFAULT_UPSTREAM_KEY` 只作用于默认上游，且仅当客户端未提供 `Authorization` 或使用保留占位 `agenttrace` 时替换；显式 `X-Upstream-Base` 直连始终原样透传，不注入服务端密钥。
+- 每日预算按 UTC 当天 `[00:00, 次日 00:00)` 内每次 `openai-proxy` LLM Span 的 `total_tokens` 统计，而不是按聚合 Trace 的首次开始时间；跨天复用 Trace ID 不会漏计，未来时间戳也不会计入今天。超出后返回 429，设为 0 表示不限。
 - 成本按实际 usage 与配置的每百万 Token USD 单价估算；未配置价格或上游未返回 usage 时不产生可靠成本值。
-- 流式响应在收到上游响应头前可切换路由；开始向客户端发送 SSE 后不再重试，以免拼接受损响应。
+- 流式响应在收到上游响应头前可切换路由；开始向客户端发送 SSE 后不再重试，以免拼接受损响应。下游主动停止或断开会记录未完成 Trace 并完成资源清理，但不会把健康上游计入失败熔断。
 - 当前不包含相同 Prompt 缓存、多用户 Quota 或完整 LiteLLM 协议适配。
 
 ## 接入

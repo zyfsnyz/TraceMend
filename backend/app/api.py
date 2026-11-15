@@ -16,6 +16,7 @@ from .reports import render_markdown, render_pdf
 from .rules import run_rules
 from .schemas import CommentCreate, CommentPatch, IngestIn, TraceCommentIn
 from .serializers import comment_dict, finding_dict, span_dict, trace_dict
+from .usage import daily_token_usage
 
 router = APIRouter(prefix="/api")
 
@@ -282,16 +283,7 @@ def get_stats(request: Request, days: int = Query(default=30, ge=1, le=3650)):
             (trace.started_at or trace.created_at).date().isoformat() for trace in traces
         )
         models = Counter(trace.model or "未知模型" for trace in traces)
-        today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-        today_tokens = int(
-            session.scalar(
-                select(func.sum(Trace.total_tokens)).where(
-                    Trace.source == "openai-proxy",
-                    func.coalesce(Trace.started_at, Trace.created_at) >= today,
-                )
-            )
-            or 0
-        )
+        today_tokens = daily_token_usage(request.app.state.session_factory)
         costs = []
         for trace in traces:
             gateway = (trace.metadata_json or {}).get("gateway", {})

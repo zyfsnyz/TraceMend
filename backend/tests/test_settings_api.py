@@ -21,6 +21,13 @@ SENSITIVE_QUERY_KEYS = [
     "SECRET",
     "Password",
     "credential",
+    "client_secret",
+    "refresh_token",
+    "api-key",
+    "sig",
+    "signature",
+    "X-Amz-Signature",
+    "X-Goog-Credential",
 ]
 
 
@@ -407,6 +414,73 @@ async def test_public_urls_redact_all_legacy_credential_query_values(client, app
         assert public_query["tenant"] == "cn"
         for key, secret_value in sensitive_values.items():
             assert public_query[key] != secret_value
+
+
+@pytest.mark.asyncio
+async def test_public_urls_mask_unrecognized_query_values_by_default(client, application):
+    application.state.settings = application.state.settings.model_copy(
+        update={
+            "default_mcp_upstream": (
+                "https://legacy.example.com/mcp?tenant=cn&custom=unrecognized-secret"
+            )
+        }
+    )
+
+    response = await client.get("/api/settings")
+
+    assert response.status_code == 200
+    assert "unrecognized-secret" not in response.text
+    query = dict(
+        parse_qsl(
+            urlsplit(response.json()["default_mcp_upstream"]).query,
+            keep_blank_values=True,
+        )
+    )
+    assert query == {"tenant": "cn", "custom": "REDACTED"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path", "payload", "secrets"),
+    [
+        (
+            "PUT",
+            "/api/settings",
+            {"default_upstream_key": "settings-validation-secret", "default_upstream_model": None},
+            ["settings-validation-secret"],
+        ),
+        (
+            "POST",
+            "/api/gateway/routes",
+            {
+                "name": "invalid URL",
+                "match_model": "demo-*",
+                "target_model": "demo",
+                "upstream_base": "https://user:url-validation-secret@example.com/v1",
+                "api_key": "route-create-validation-secret",
+            },
+            ["url-validation-secret", "route-create-validation-secret"],
+        ),
+        (
+            "PATCH",
+            "/api/gateway/routes/not-yet-created",
+            {"api_key": "route-patch-validation-secret", "name": None},
+            ["route-patch-validation-secret"],
+        ),
+    ],
+)
+async def test_validation_errors_never_echo_sensitive_input(
+    client, method, path, payload, secrets
+):
+    response = await client.request(method, path, json=payload)
+
+    assert response.status_code == 422
+    for secret in secrets:
+        assert secret not in response.text
+    assert response.json()["detail"]
+    for error in response.json()["detail"]:
+        assert "input" not in error
+        assert "ctx" not in error
 
 
 def test_env_update_removes_later_duplicates_and_restart_reads_latest(

@@ -74,4 +74,27 @@ describe('网页设置中心', () => {
       name: 'Agnes 主路由', match_model: 'agnes-*', target_model: 'agnes-3.0-flash',
     });
   });
+
+  it('编辑路由时可显式清除已保存密钥，而不是把留空当作保留', async () => {
+    api.getSettings.mockResolvedValue(settings);
+    api.getGatewayRoutes.mockResolvedValue({ items: [route] });
+    api.updateGatewayRoute.mockResolvedValue({ ...route, api_key_configured: false });
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+    await screen.findByDisplayValue('deepseek-chat');
+
+    await user.click(screen.getByRole('button', { name: '编辑路由 Agnes 主路由' }));
+    const editor = screen.getByTestId('route-editor');
+    await user.click(within(editor).getByRole('button', { name: '清除已保存密钥' }));
+    expect(within(editor).getByText('已选择清除密钥')).toBeInTheDocument();
+    const invalidFields = Array.from(editor.querySelectorAll('input'))
+      .filter((input) => !input.checkValidity())
+      .map((input) => ({ label: input.labels?.[0]?.textContent, value: input.value, message: input.validationMessage }));
+    expect(invalidFields).toEqual([]);
+    await user.click(within(editor).getByRole('button', { name: '保存规则' }));
+
+    await waitFor(() => expect(api.updateGatewayRoute).toHaveBeenCalled());
+    expect(api.updateGatewayRoute.mock.calls[0][0]).toBe('route-1');
+    expect(api.updateGatewayRoute.mock.calls[0][1].api_key).toBe('');
+  });
 });

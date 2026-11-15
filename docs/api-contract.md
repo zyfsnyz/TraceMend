@@ -48,13 +48,13 @@ Span kind：`user | llm | tool | tool_result | system | mcp`。工具调用使�
 
 ## 连接设置与网关
 
-`GET /api/settings` 返回连接和网关配置，密钥字段仅为 `default_upstream_key_configured/default_mcp_key_configured/check_model_key_configured` 布尔值。`PUT /api/settings` 接受 `SettingsPatch`；未提交或为 null 的密钥保持不变，空字符串清除密钥；其他字段显式为 null 时返回 422，校验失败不会写入部分配置。OpenAI Base URL 不允许 query/fragment；MCP URL 不允许 fragment 或常见凭据查询参数，请改用专用密钥字段。公开读取（`GET /api/settings`、`GET /api/gateway/routes`）返回的 URL 一律移除 userinfo（`user:pass@`）与 fragment，敏感查询参数值替换为 `REDACTED`，非敏感查询参数（如 `tenant=cn`）原样保留；历史遗留配置同样适用，任何密码、密钥或片段都不会回显。`POST /api/settings/test` body 为 `{"kind":"openai|check|mcp"}`，使用已保存配置测试；响应为 `{ok,kind,message,model?}`，不返回密钥。
+`GET /api/settings` 返回连接和网关配置，密钥字段仅为 `default_upstream_key_configured/default_mcp_key_configured/check_model_key_configured` 布尔值。`PUT /api/settings` 接受 `SettingsPatch`；未提交或为 null 的密钥保持不变，空字符串清除密钥；其他字段显式为 null 时返回 422，校验失败不会写入部分配置。OpenAI Base URL 不允许 query/fragment；MCP URL 不允许 fragment 或常见凭据查询参数，请改用专用密钥字段。公开读取（`GET /api/settings`、`GET /api/gateway/routes`）返回的 URL 一律移除 userinfo（`user:pass@`）与 fragment；只有 `tenant/mode/region/project/namespace/api-version` 等明确用于展示的查询值原样保留，其余查询值默认替换为 `REDACTED`。历史遗留配置同样适用，任何密码、密钥或片段都不会回显。所有请求校验 422 响应仅保留错误位置、类型和消息，统一删除 Pydantic 的 `input` 与 `ctx`，避免回显请求体中的密钥。`POST /api/settings/test` body 为 `{"kind":"openai|check|mcp"}`，使用已保存配置测试；响应为 `{ok,kind,message,model?}`，不返回密钥。
 
 `POST /api/gateway/routes` 创建路由，字段为 `name/match_model/target_model/upstream_base/api_key/priority/enabled/input_price_per_million/output_price_per_million`。读取时只有 `api_key_configured`，没有 `api_key` 或 `key_name`。PATCH 支持相同字段的可选更新；普通字段显式 null 返回 422，`api_key: null` 保持不变、空字符串清除；DELETE 删除路由；`POST /api/gateway/routes/{id}/reset` 重置熔断。
 
-路由按有效模型（请求 model 或默认模型）执行 `fnmatch(model, match_model)`，并按 `priority/id` 排序。408、425、429、5xx 和网络错误可切换下一路由，其他 4xx（400/401/403/404 等）不重试；SSE 仅在完整结束后确认成功。每日 Token 预算为按已落库用量检查的软预算，不做并发预留，超限返回 429。显式 `X-Upstream-Base` 绕过路由、默认模型补全、预算与熔断状态，且不会注入服务端保存的默认密钥。熔断快照为 `{status,failures,open_remaining_seconds}`。
+路由按有效模型（请求 model 或默认模型）执行 `fnmatch(model, match_model)`，并按 `priority/id` 排序。408、425、429、5xx 和网络错误可切换下一路由，其他 4xx（400/401/403/404 等）不重试；SSE 仅在完整结束后确认成功，下游取消或断开会记录未完成 Trace，但不计入上游失败熔断。每日 Token 预算按 UTC `[今日 00:00, 明日 00:00)` 内每次 LLM Span 的调用时间与 usage 统计，跨天复用 Trace ID 仍按当天调用计入，未来时间戳不计入今天；这是按已落库用量检查的软预算，不做并发预留，超限返回 429。显式 `X-Upstream-Base` 绕过路由、默认模型补全、预算与熔断状态，且不会注入服务端保存的默认密钥。熔断快照为 `{status,failures,open_remaining_seconds}`。
 
-`Authorization` 契约：路由配置了 `api_key` 时，转发请求使用该密钥并覆盖客户端 `Authorization`；路由未配置密钥时，原样透传客户端 `Authorization`。默认上游配置了 `DEFAULT_UPSTREAM_KEY` 时，仅当客户端未提供 `Authorization` 或使用保留占位 `api_key="agenttrace"` 才替换为服务端密钥，真实客户端密钥优先；占位替换只适用于默认上游，显式 `X-Upstream-Base` 直连始终按客户端原样透传。
+认证头契约：路由配置了 `api_key` 时，转发请求使用该密钥覆盖客户端 `Authorization`，并统一清除 `api-key`、`x-api-key`、Cookie、token/secret/signature/credential 等其他客户端凭据头。未配置密钥时只有首个候选路由可透传调用方凭据；重试到后续候选时一律清除这些凭据，备用路由必须配置独立 `api_key`，防止密钥被发送至另一个服务商。默认上游配置了 `DEFAULT_UPSTREAM_KEY` 时，仅当客户端未提供 `Authorization` 或使用保留占位 `api_key="agenttrace"` 才替换为服务端密钥，真实客户端密钥优先；占位替换只适用于默认上游，显式 `X-Upstream-Base` 直连始终按客户端原样透传。
 
 ## 评论
 

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -56,6 +56,76 @@ async def test_openai_same_trace_id_appends_spans_and_aggregates_trace(client, o
     assert [span["sequence"] for span in spans] == [0, 1, 2, 3, 4, 5]
     answers = [span["content"] for span in spans if span["kind"] == "llm"]
     assert answers == ["first answer", "second answer"]
+
+
+@pytest.mark.asyncio
+async def test_daily_usage_follows_each_invocation_when_trace_id_crosses_days(
+    client, application, openai_upstream
+):
+    from app.models import Trace
+
+    await client.put(
+        "/api/settings",
+        json={
+            "default_upstream_base": openai_upstream.base_url,
+            "gateway_daily_token_budget": 1,
+        },
+    )
+    headers = {"X-AgentTrace-Id": "openai-cross-day-budget"}
+    first = await client.post(
+        "/v1/chat/completions",
+        json={"model": "cross-day-model", "messages": []},
+        headers=headers,
+    )
+    assert first.status_code == 200
+
+    yesterday = datetime.now(UTC) - timedelta(days=1)
+    with application.state.session_factory() as session:
+        trace = session.get(Trace, "openai-cross-day-budget")
+        trace.started_at = yesterday
+        trace.created_at = yesterday
+        for span in trace.spans:
+            span.started_at = yesterday
+        session.commit()
+
+    second = await client.post(
+        "/v1/chat/completions",
+        json={"model": "cross-day-model", "messages": []},
+        headers=headers,
+    )
+    assert second.status_code == 200
+    stats = (await client.get("/api/stats?days=30")).json()
+    assert stats["today_tokens"] == 18
+
+    from app.models import Span
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    with application.state.session_factory() as session:
+        session.add(
+            Span(
+                id="future-budget-span",
+                trace_id="openai-cross-day-budget",
+                sequence=99,
+                kind="llm",
+                name="未来时钟调用",
+                started_at=tomorrow,
+                total_tokens=999,
+            )
+        )
+        session.commit()
+    future_stats = (await client.get("/api/stats?days=30")).json()
+    assert future_stats["today_tokens"] == 18
+
+    before = len(openai_upstream.requests)
+    third = await client.post(
+        "/v1/chat/completions",
+        json={"model": "cross-day-model", "messages": []},
+        headers=headers,
+    )
+    assert third.status_code == 429
+    assert len(openai_upstream.requests) == before
 
 
 @pytest.mark.asyncio

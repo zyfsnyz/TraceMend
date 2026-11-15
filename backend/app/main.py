@@ -1,6 +1,8 @@
 import secrets
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -43,6 +45,19 @@ def create_app() -> FastAPI:
     application.include_router(gateway_router)
     application.include_router(proxy_router)
     application.include_router(mcp_router)
+
+    @application.exception_handler(RequestValidationError)
+    async def validation_error_without_sensitive_input(_request, exc: RequestValidationError):
+        # Pydantic's default ``input``/``ctx`` can contain the complete request body,
+        # including API keys or URL passwords. Keep actionable locations/messages only.
+        detail = [
+            {key: value for key, value in error.items() if key not in {"input", "ctx"}}
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content=jsonable_encoder({"detail": detail}),
+        )
 
     @application.middleware("http")
     async def admin_auth(request: Request, call_next):

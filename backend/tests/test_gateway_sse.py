@@ -244,7 +244,7 @@ async def test_relay_sse_always_closes_both_resources_during_finalization_failur
 
 
 @pytest.mark.asyncio
-async def test_sse_cancellation_after_done_is_not_recorded_as_success(monkeypatch):
+async def test_sse_cancellation_after_done_does_not_open_circuit(monkeypatch):
     class CancelledUpstream(FakeUpstream):
         async def aiter_raw(self):
             yield b"data: [DONE]\n\n"
@@ -279,8 +279,8 @@ async def test_sse_cancellation_after_done_is_not_recorded_as_success(monkeypatc
         ):
             pass
 
-    assert circuits.snapshot("default")["status"] == "open"
-    assert attempts[-1]["outcome"] == "error"
+    assert circuits.snapshot("default")["status"] == "closed"
+    assert attempts[-1]["outcome"] == "cancelled"
     assert upstream.close_attempted is True
     assert client.closed is True
 
@@ -330,6 +330,15 @@ async def test_relay_sse_shield_completes_async_cleanup_after_consumer_cancellat
     client = SlowClient(events)
     delivered = anyio.Event()
     persisted = []
+    circuits = CircuitRegistry()
+    attempts = []
+    candidate = UpstreamCandidate("http://upstream.test/v1", "demo")
+    settings = SimpleNamespace(
+        gateway_failure_threshold=1,
+        gateway_cooldown_seconds=60,
+        default_input_price_per_million=0,
+        default_output_price_per_million=0,
+    )
     monkeypatch.setattr(
         "app.proxy.persist_openai_trace",
         lambda *args, **kwargs: persisted.append(args),
@@ -343,6 +352,11 @@ async def test_relay_sse_shield_completes_async_cleanup_after_consumer_cancellat
             "sse-disconnect-shield",
             {"model": "demo", "messages": []},
             datetime.now(UTC),
+            candidate,
+            settings,
+            "demo",
+            attempts,
+            circuits,
         ):
             delivered.set()
 
@@ -360,3 +374,10 @@ async def test_relay_sse_shield_completes_async_cleanup_after_consumer_cancellat
     assert upstream.close_completed is True
     assert client.closed is True
     assert persisted
+    assert persisted[0][4] == "failed"
+    assert attempts[-1]["outcome"] == "cancelled"
+    assert circuits.snapshot("default") == {
+        "status": "closed",
+        "failures": 0,
+        "open_remaining_seconds": 0,
+    }

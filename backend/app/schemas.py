@@ -115,19 +115,45 @@ SENSITIVE_QUERY_KEYS = frozenset(
 )
 
 
+PUBLIC_QUERY_VALUE_KEYS = frozenset(
+    {"tenant", "mode", "region", "project", "namespace", "api-version"}
+)
+SENSITIVE_QUERY_MARKERS = (
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "signature",
+    "authorization",
+)
+
+
+def normalized_query_key(key: str) -> str:
+    return unquote(key).casefold().replace("-", "_")
+
+
+def is_sensitive_query_key(key: str) -> bool:
+    normalized = normalized_query_key(key)
+    return (
+        normalized in SENSITIVE_QUERY_KEYS
+        or normalized in {"sig", "code", "jwt", "assertion", "session", "session_id"}
+        or normalized.endswith("_key")
+        or any(marker in normalized for marker in SENSITIVE_QUERY_MARKERS)
+    )
+
+
 def has_sensitive_query(query: str) -> bool:
     return any(
-        key.casefold() in SENSITIVE_QUERY_KEYS
+        is_sensitive_query_key(key)
         for key, _ in parse_qsl(query, keep_blank_values=True)
     )
 
 
 def redact_url_credentials(value: str) -> str:
-    """Return a public-safe URL: no userinfo, no fragment, sensitive query values masked.
+    """Return a public-safe URL without userinfo, fragments, or unchecked query values.
 
-    Non-sensitive query parameters are preserved verbatim so legacy URLs such as
-    ``...?tenant=cn`` remain usable in the UI, but nothing that looks like a
-    credential may be echoed back to a client.
+    Only a small allowlist of display-safe query values is preserved. Unknown keys
+    are masked by default so legacy OAuth/signed URLs cannot echo credentials.
     """
     if not value:
         return value
@@ -143,7 +169,7 @@ def redact_url_credentials(value: str) -> str:
         if not segment:
             continue
         key, _, _ = segment.partition("=")
-        if unquote(key).casefold() in SENSITIVE_QUERY_KEYS:
+        if unquote(key).casefold() not in PUBLIC_QUERY_VALUE_KEYS:
             segments.append(f"{key}=REDACTED")
         else:
             segments.append(segment)

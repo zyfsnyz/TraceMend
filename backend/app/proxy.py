@@ -7,13 +7,13 @@ import anyio
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from sqlalchemy import func, select
 
 from .audit import make_span
 from .gateway import gateway_metadata, load_candidates
 from .models import Trace
 from .rules import run_rules
 from .schemas import SpanIn
+from .usage import daily_token_usage
 
 router = APIRouter()
 HOP_BY_HOP = {
@@ -353,6 +353,7 @@ async def relay_sse(
 ):
     accumulator = SSEAccumulator()
     error = None
+    cancelled = False
     try:
         async for chunk in upstream.aiter_raw():
             accumulator.feed(chunk)
@@ -361,6 +362,7 @@ async def relay_sse(
     except Exception as exc:
         error = {"type": type(exc).__name__, "message": str(exc)}
     except BaseException as exc:
+        cancelled = isinstance(exc, (GeneratorExit, anyio.get_cancelled_exc_class()))
         error = {"type": type(exc).__name__, "message": str(exc)}
         raise
     finally:
@@ -378,16 +380,22 @@ async def relay_sse(
                         completed = error is None and accumulator.done
                         if completed:
                             circuits.record_success(candidate.circuit_key)
-                        else:
+                        elif not cancelled:
                             circuits.record_failure(
                                 candidate.circuit_key,
                                 settings.gateway_failure_threshold,
                                 settings.gateway_cooldown_seconds,
                             )
                         if attempts is not None:
+                            if completed:
+                                outcome = "success"
+                            elif cancelled:
+                                outcome = "cancelled"
+                            else:
+                                outcome = "error"
                             attempt = {
                                 **attempt_info(candidate),
-                                "outcome": "success" if completed else "error",
+                                "outcome": outcome,
                                 "status_code": upstream.status_code,
                             }
                             if error is not None:
@@ -448,8 +456,51 @@ def retryable_upstream(status_code: int) -> bool:
     return status_code in {408, 425, 429} or status_code >= 500
 
 
-def candidate_headers(request: Request, candidate, settings) -> dict[str, str]:
+async def close_attempt_resources(upstream, client, *, suppress_errors: bool = False):
+    """Close an attempt even during cancellation; optionally preserve the original error."""
+    with anyio.CancelScope(shield=True):
+        try:
+            if upstream is not None:
+                if suppress_errors:
+                    with suppress(Exception):
+                        await upstream.aclose()
+                else:
+                    await upstream.aclose()
+        finally:
+            if suppress_errors:
+                with suppress(Exception):
+                    await client.aclose()
+            else:
+                await client.aclose()
+
+
+def is_client_credential_header(name: str) -> bool:
+    normalized = name.lower().replace("_", "-")
+    markers = (
+        "authorization",
+        "api-key",
+        "apikey",
+        "token",
+        "secret",
+        "credential",
+        "signature",
+        "cookie",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def strip_client_credentials(headers: dict[str, str]) -> None:
+    for key in list(headers):
+        if is_client_credential_header(key):
+            headers.pop(key)
+
+
+def candidate_headers(
+    request: Request, candidate, settings, *, forward_client_authorization: bool = True
+) -> dict[str, str]:
     headers = forward_request_headers(request)
+    if not forward_client_authorization:
+        strip_client_credentials(headers)
     authorization = next(
         (value for key, value in headers.items() if key.lower() == "authorization"),
         None,
@@ -458,9 +509,7 @@ def candidate_headers(request: Request, candidate, settings) -> dict[str, str]:
         authorization is None or authorization == "Bearer agenttrace"
     )
     if candidate.api_key and (candidate.route is not None or use_default_key):
-        for key in list(headers):
-            if key.lower() == "authorization":
-                headers.pop(key)
+        strip_client_credentials(headers)
         headers["Authorization"] = f"Bearer {candidate.api_key}"
     headers.setdefault("Content-Type", "application/json")
     return headers
@@ -480,19 +529,6 @@ def response_json(content: bytes) -> object:
     except (json.JSONDecodeError, UnicodeDecodeError):
         return {"content": content.decode(errors="replace")}
 
-
-def daily_token_usage(session_factory) -> int:
-    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    with session_factory() as session:
-        return int(
-            session.scalar(
-                select(func.sum(Trace.total_tokens)).where(
-                    Trace.source == "openai-proxy",
-                    func.coalesce(Trace.started_at, Trace.created_at) >= today,
-                )
-            )
-            or 0
-        )
 
 
 @router.post("/v1/chat/completions")
@@ -545,7 +581,12 @@ async def chat_completions(request: Request):
         if candidate.target_model:
             attempt_payload["model"] = candidate.target_model
         body = json.dumps(attempt_payload, ensure_ascii=False).encode("utf-8")
-        headers = candidate_headers(request, candidate, settings)
+        headers = candidate_headers(
+            request,
+            candidate,
+            settings,
+            forward_client_authorization=candidate.explicit or index == 0,
+        )
         url = f"{candidate.upstream_base.rstrip('/')}/chat/completions"
         client = httpx.AsyncClient(timeout=60)
         upstream = None
@@ -561,14 +602,7 @@ async def chat_completions(request: Request):
             if not upstream.is_success:
                 content = await upstream.aread()
         except httpx.HTTPError as exc:
-            with anyio.CancelScope(shield=True):
-                try:
-                    if upstream is not None:
-                        with suppress(Exception):
-                            await upstream.aclose()
-                finally:
-                    with suppress(Exception):
-                        await client.aclose()
+            await close_attempt_resources(upstream, client, suppress_errors=True)
             if not candidate.explicit:
                 request.app.state.circuits.record_failure(
                     candidate.circuit_key,
@@ -598,6 +632,10 @@ async def chat_completions(request: Request):
                 exc,
                 gateway,
             )
+        except BaseException:
+            # Cancellation is not an httpx.HTTPError; never leak the attempt resources.
+            await close_attempt_resources(upstream, client, suppress_errors=True)
+            raise
 
         if upstream.is_success:
             if not stream:
@@ -635,8 +673,7 @@ async def chat_completions(request: Request):
             )
             media_type = upstream.headers.get("content-type")
             status_code = upstream.status_code
-            await upstream.aclose()
-            await client.aclose()
+            await close_attempt_resources(upstream, client)
             gateway = (
                 None
                 if candidate.explicit
@@ -665,8 +702,7 @@ async def chat_completions(request: Request):
         status_code = upstream.status_code
         response_headers = forward_response_headers(upstream.headers, trace_id, decoded=True)
         media_type = upstream.headers.get("content-type")
-        await upstream.aclose()
-        await client.aclose()
+        await close_attempt_resources(upstream, client)
         retryable = retryable_upstream(status_code)
         if retryable and not candidate.explicit:
             request.app.state.circuits.record_failure(

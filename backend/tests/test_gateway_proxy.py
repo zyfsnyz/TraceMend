@@ -320,6 +320,137 @@ async def test_error_body_read_and_upstream_close_failures_still_fall_back(
 
 
 @pytest.mark.asyncio
+async def test_retry_does_not_forward_caller_authorization_to_another_upstream(
+    client, monkeypatch
+):
+    seen = []
+
+    async def handle(request):
+        seen.append((request.url.host, request.headers.get("Authorization")))
+        if request.url.host == "first-upstream.test":
+            return httpx.Response(429, json={"error": {"message": "retry"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "fallback-ok",
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    transport = httpx.MockTransport(handle)
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        return real_async_client(transport=transport, timeout=60)
+
+    monkeypatch.setattr("app.proxy.httpx.AsyncClient", client_factory)
+    await create_route(
+        client,
+        name="调用方密钥主路由",
+        target_model="first-model",
+        upstream_base="http://first-upstream.test/v1",
+        priority=1,
+    )
+    await create_route(
+        client,
+        name="不同上游备用路由",
+        target_model="second-model",
+        upstream_base="http://second-upstream.test/v1",
+        priority=2,
+    )
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "demo-cross-upstream-auth", "messages": []},
+        headers={"Authorization": "Bearer caller-cross-upstream-secret"},
+    )
+
+    assert response.status_code == 200
+    assert [host for host, _ in seen] == ["first-upstream.test", "second-upstream.test"]
+    assert seen[0][1] == "Bearer caller-cross-upstream-secret"
+    assert seen[1][1] is None
+
+
+@pytest.mark.asyncio
+async def test_route_key_and_failover_strip_other_client_credentials(client, monkeypatch):
+    seen = []
+    credential_names = (
+        "authorization",
+        "api-key",
+        "x-api-key",
+        "x-goog-api-key",
+        "cookie",
+    )
+
+    async def handle(request):
+        seen.append(
+            (
+                request.url.host,
+                {name: request.headers.get(name) for name in credential_names},
+                request.headers.get("x-request-id"),
+            )
+        )
+        if request.url.host == "first-upstream.test":
+            return httpx.Response(429, json={"error": {"message": "retry"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "credential-fallback-ok",
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    transport = httpx.MockTransport(handle)
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        return real_async_client(transport=transport, timeout=60)
+
+    monkeypatch.setattr("app.proxy.httpx.AsyncClient", client_factory)
+    await create_route(
+        client,
+        name="独立密钥主路由",
+        target_model="first-model",
+        upstream_base="http://first-upstream.test/v1",
+        api_key="route-primary-key",
+        priority=1,
+    )
+    await create_route(
+        client,
+        name="无客户端凭据备用路由",
+        target_model="second-model",
+        upstream_base="http://second-upstream.test/v1",
+        priority=2,
+    )
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "demo-credential-isolation", "messages": []},
+        headers={
+            "Authorization": "Bearer caller-secret",
+            "api-key": "caller-azure-secret",
+            "X-Api-Key": "caller-anthropic-secret",
+            "X-Goog-Api-Key": "caller-google-secret",
+            "Cookie": "session=caller-session-secret",
+            "X-Request-Id": "safe-correlation-id",
+        },
+    )
+
+    assert response.status_code == 200
+    assert [host for host, _, _ in seen] == ["first-upstream.test", "second-upstream.test"]
+    primary = seen[0][1]
+    assert primary["authorization"] == "Bearer route-primary-key"
+    assert all(primary[name] is None for name in credential_names if name != "authorization")
+    assert all(value is None for value in seen[1][1].values())
+    assert [request_id for _, _, request_id in seen] == [
+        "safe-correlation-id",
+        "safe-correlation-id",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_daily_token_budget_blocks_before_calling_upstream(client, openai_upstream):
     await client.put(
         "/api/settings",

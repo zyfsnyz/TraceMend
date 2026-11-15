@@ -85,6 +85,15 @@ python scripts/e2e_smoke.py --cleanup
 - 修改后的 Compose YAML 已重新解析通过；`netstat` 确认当前 3000/8000 服务均只监听 `127.0.0.1`。
 - 再次执行 `scripts/e2e_smoke.py --cleanup`，非流式、SSE、MCP、SQLite 落库、Markdown/PDF 和清理全部通过。
 
+### 最终安全复核与数据清洗（2026-11-15）
+
+- 针对独立审查发现的问题增加 RED → GREEN 回归：422 不再通过 `detail.input/ctx` 回显密钥；公开 URL 默认遮蔽未明确允许的查询值；跨上游重试和路由密钥注入会统一清理 Authorization、api-key、x-api-key、Cookie 及其他客户端凭据头。
+- 响应头前取消会在受保护的清理作用域内关闭上游响应与客户端；下游取消 SSE 记录未完成 Trace，但不误触健康上游熔断。
+- 每日 Token 预算和 `today_tokens` 改按 UTC `[今日 00:00, 明日 00:00)` 内每次 LLM Span 的调用时间统计，覆盖跨天复用 Trace ID 和未来时间戳边界。
+- 接入示例使用 `your-configured-model` 占位，curl 可省略 `model`；路由编辑可显式清除密钥，价格小数输入不会阻止表单提交。
+- 后端实测 **213 项通过**，`ruff check .` 通过；前端 **18 个文件、56 项通过**，ESLint、TypeScript 和生产构建通过，1629 个模块完成转换；`git diff --check` 通过。
+- 已删除本机数据库中的 7 条演示/验收 Trace 及其关联数据，复核 `traces/spans/findings/comments/gateway_routes` 均为 0，SQLite `integrity_check=ok`。真实 `.env`、数据库、报告和缓存均由 Git 忽略，不纳入提交。
+
 ### 未执行项
 
 - 本机没有安装 Docker，未实际执行容器构建和 `docker compose up`。已验证 Compose YAML 可解析、服务端口映射为 `127.0.0.1`，但容器运行时仍需在安装 Docker 的环境复验。

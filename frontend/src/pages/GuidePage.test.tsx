@@ -42,4 +42,16 @@ describe('GuidePage 占位认证', () => {
       );
     }
   });
+
+  it('模型示例使用明确占位，curl 可省略 model 以使用服务端默认模型', () => {
+    render(<MemoryRouter><GuidePage /></MemoryRouter>);
+
+    const pythonCard = screen.getByRole('heading', { name: 'Python OpenAI SDK' }).closest('section');
+    expect(pythonCard).toHaveTextContent('model="your-configured-model"');
+    expect(pythonCard).not.toHaveTextContent('deepseek-chat');
+
+    const curlCard = screen.getByRole('heading', { name: '直接调用已配置代理' }).closest('section');
+    expect(curlCard).not.toHaveTextContent('deepseek-chat');
+    expect(curlCard).not.toHaveTextContent('"model":');
+  });
 });
