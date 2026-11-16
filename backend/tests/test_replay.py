@@ -538,9 +538,24 @@ async def test_replay_returns_full_lineage_and_output_diff_without_mutating_sour
     assert replay_trace["parent_id"] == "replay-lineage-source"
     assert replay_span["trace_id"] == replay_trace["id"]
     assert replay_span["kind"] == "llm"
-    assert replay_span["output"]["choices"][0]["message"]["tool_calls"] == [
-        WEATHER_TOOL_CALL
-    ]
+    fresh_output = replay_span["output"]
+    assert fresh_output != source_output
+    assert fresh_output["id"] == "chatcmpl-local"
+    assert fresh_output["model"] == "current-from-original"
+    fresh_message = fresh_output["choices"][0]["message"]
+    assert fresh_message["content"] == "明天 25°C"
+    assert fresh_message["reasoning_content"] == "查过天气"
+    assert fresh_message["tool_calls"] == [WEATHER_TOOL_CALL]
+    assert fresh_output["usage"] == {
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+        "total_tokens": 18,
+    }
+    assert replay_span["content"] == "明天 25°C"
+    assert replay_span["reasoning"] == "查过天气"
+    assert replay_span["prompt_tokens"] == 11
+    assert replay_span["completion_tokens"] == 7
+    assert replay_span["total_tokens"] == 18
     assert body["source_span"]["id"] == "source-llm"
     comparison = body["comparison"]
     assert comparison["status"] == "different"
@@ -1177,7 +1192,16 @@ async def test_replay_persists_upstream_failure_as_auditable_201_attempt(
 async def test_replay_preserves_sse_mode_and_persists_normalized_stream_output(
     client, openai_upstream
 ):
-    original_stream = stream_output()
+    fresh_stream = stream_output()
+    source_output = deepcopy(fresh_stream)
+    source_message = source_output["choices"][0]["message"]
+    source_message["content"] = "昨天 20°C"
+    source_message["reasoning_content"] = "旧流式推理"
+    source_output["usage"] = {
+        "prompt_tokens": 7,
+        "completion_tokens": 3,
+        "total_tokens": 10,
+    }
     stream_input = {
         "model": "stream-model",
         "stream": True,
@@ -1188,7 +1212,7 @@ async def test_replay_preserves_sse_mode_and_persists_normalized_stream_output(
         client,
         "replay-sse-source",
         span_input=stream_input,
-        span_output=original_stream,
+        span_output=source_output,
     )
     await configure_default_upstream(client, openai_upstream)
 
@@ -1197,23 +1221,29 @@ async def test_replay_preserves_sse_mode_and_persists_normalized_stream_output(
     assert response.status_code == 201
     assert openai_upstream.requests[-1]["payload"] == stream_input
     body = response.json()
-    assert body["replay_span"]["output"] == original_stream
-    assert body["replay_span"]["content"] == "明天 25°C"
-    assert body["replay_span"]["reasoning"] == "需要"
-    assert body["replay_span"]["total_tokens"] == 29
-    assert body["comparison"]["status"] == "same"
-    assert body["comparison"]["content_equal"] is True
-    assert body["comparison"]["reasoning_equal"] is True
-    assert body["comparison"]["tool_calls_equal"] is True
-    assert body["comparison"]["content_similarity"] == 1.0
+    replay_span = body["replay_span"]
+    assert replay_span["output"] == fresh_stream
+    assert replay_span["output"] != source_output
+    assert replay_span["content"] == "明天 25°C"
+    assert replay_span["reasoning"] == "需要"
+    assert replay_span["prompt_tokens"] == 20
+    assert replay_span["completion_tokens"] == 9
+    assert replay_span["total_tokens"] == 29
+    comparison = body["comparison"]
+    assert comparison["status"] == "different"
+    assert comparison["content_equal"] is False
+    assert comparison["reasoning_equal"] is False
+    assert comparison["tool_calls_equal"] is True
+    assert 0 <= comparison["content_similarity"] < 1
     replay_detail = (
         await client.get(f"/api/traces/{body['replay_trace']['id']}")
     ).json()
     persisted_replay_span = next(
-        span for span in replay_detail["spans"] if span["id"] == body["replay_span"]["id"]
+        span for span in replay_detail["spans"] if span["id"] == replay_span["id"]
     )
-    assert persisted_replay_span["output"] == original_stream
-    assert persisted_replay_span["content"] == body["replay_span"]["content"]
-    assert persisted_replay_span["reasoning"] == body["replay_span"]["reasoning"]
-    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        assert persisted_replay_span[field] == body["replay_span"][field]
+    assert persisted_replay_span["output"] == fresh_stream
+    assert persisted_replay_span["content"] == "明天 25°C"
+    assert persisted_replay_span["reasoning"] == "需要"
+    assert persisted_replay_span["prompt_tokens"] == 20
+    assert persisted_replay_span["completion_tokens"] == 9
+    assert persisted_replay_span["total_tokens"] == 29
