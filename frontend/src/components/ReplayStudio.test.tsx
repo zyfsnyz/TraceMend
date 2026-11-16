@@ -81,6 +81,12 @@ async function confirmReplay(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole('checkbox', { name: /确认.*可能产生费用/ }));
 }
 
+async function ensureReplayConfirmed(user: ReturnType<typeof userEvent.setup>) {
+  const confirmation = screen.getByRole('checkbox', { name: /确认.*可能产生费用/ });
+  if (!confirmation.matches(':checked')) await user.click(confirmation);
+  expect(confirmation).toBeChecked();
+}
+
 describe('ReplayStudio 真实重放交互', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -92,6 +98,17 @@ describe('ReplayStudio 真实重放交互', () => {
 
     expect(screen.getByText('真实重放仅支持 LLM Span')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '开始真实重放' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('model')).not.toBeInTheDocument();
+    expect(replaySpan).not.toHaveBeenCalled();
+  });
+
+  it('未选择 Span 时给出明确选择指引，不渲染真实重放表单或提交入口', () => {
+    const { container } = renderStudio(null);
+
+    expect(screen.getByText(/请选择.*LLM Span.*真实重放/)).toBeInTheDocument();
+    expect(container.querySelector('form')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '开始真实重放' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('checkbox', { name: /确认.*可能产生费用/ })).not.toBeInTheDocument();
     expect(screen.queryByLabelText('model')).not.toBeInTheDocument();
     expect(replaySpan).not.toHaveBeenCalled();
   });
@@ -154,6 +171,36 @@ describe('ReplayStudio 真实重放交互', () => {
     }, expect.any(String)));
   });
 
+  it('只编辑部分参数时仅发送这些字段，不夹带原始请求的未编辑默认值', async () => {
+    const user = userEvent.setup();
+    renderStudio({
+      ...llmSpan,
+      input: {
+        model: 'original-model',
+        messages: [{ role: 'user', content: '问题' }],
+        temperature: 0.8,
+        top_p: 1,
+        seed: 99,
+        max_tokens: 256,
+      },
+    });
+
+    await user.type(screen.getByLabelText('temperature'), '0.25');
+    await user.type(screen.getByLabelText('max_tokens'), '128');
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    await waitFor(() => expect(replaySpan).toHaveBeenCalledWith('trace-1', 'span-1', {
+      confirm: true,
+      overrides: { temperature: 0.25, max_tokens: 128 },
+    }, expect.any(String)));
+    const payload = vi.mocked(replaySpan).mock.calls[0]?.[2];
+    expect(payload?.overrides).toEqual({ temperature: 0.25, max_tokens: 128 });
+    expect(payload?.overrides).not.toHaveProperty('model');
+    expect(payload?.overrides).not.toHaveProperty('top_p');
+    expect(payload?.overrides).not.toHaveProperty('seed');
+  });
+
   it('请求待完成时禁止重复提交并显示重放进度', async () => {
     let resolveReplay!: (result: typeof completedResult) => void;
     vi.mocked(replaySpan).mockImplementationOnce(() => new Promise<typeof completedResult>((resolve) => {
@@ -180,6 +227,34 @@ describe('ReplayStudio 真实重放交互', () => {
     expect(pendingSubmit).toHaveTextContent(/重放中/);
 
     resolveReplay(completedResult);
+    expect(await screen.findByRole('heading', { name: '重放输出' })).toBeInTheDocument();
+  });
+
+  it('成功后通过新实验再次提交，并为新实验生成不同的有效 UUID', async () => {
+    const user = userEvent.setup();
+    renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    expect(await screen.findByRole('heading', { name: '重放输出' })).toBeInTheDocument();
+    expect(replaySpan).toHaveBeenCalledTimes(1);
+    const firstKey = vi.mocked(replaySpan).mock.calls[0]?.[3];
+    expect(firstKey).toMatch(UUID_PATTERN);
+
+    await user.click(screen.getByRole('button', { name: '新实验' }));
+    expect(screen.queryByRole('heading', { name: '重放输出' })).not.toBeInTheDocument();
+    await ensureReplayConfirmed(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    await waitFor(() => expect(replaySpan).toHaveBeenCalledTimes(2));
+    const secondKey = vi.mocked(replaySpan).mock.calls[1]?.[3];
+    expect(secondKey).toEqual(expect.any(String));
+    expect(secondKey).toMatch(UUID_PATTERN);
+    expect(secondKey).not.toBe(firstKey);
+    expect(replaySpan).toHaveBeenNthCalledWith(2, 'trace-1', 'span-1', {
+      confirm: true,
+      overrides: {},
+    }, secondKey);
     expect(await screen.findByRole('heading', { name: '重放输出' })).toBeInTheDocument();
   });
 
@@ -211,6 +286,70 @@ describe('ReplayStudio 真实重放交互', () => {
     expect(await screen.findByRole('heading', { name: '重放输出' })).toBeInTheDocument();
   });
 
+  it('切换 traceId/spanId 后清除旧结果，下一次提交使用新 ID 和新的 UUID', async () => {
+    const user = userEvent.setup();
+    const { rerender } = renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+    expect(await screen.findByRole('heading', { name: '重放输出' })).toBeInTheDocument();
+    const firstKey = vi.mocked(replaySpan).mock.calls[0]?.[3];
+    expect(firstKey).toMatch(UUID_PATTERN);
+
+    const nextSpan = { ...llmSpan, id: 'span-2', trace_id: 'trace-2', content: '第二条原始答案' };
+    rerender(<MemoryRouter><ReplayStudio traceId="trace-2" span={nextSpan} /></MemoryRouter>);
+
+    expect(screen.queryByRole('heading', { name: '重放输出' })).not.toBeInTheDocument();
+    expect(screen.queryByText('重放答案')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: '查看重放 Trace' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    await ensureReplayConfirmed(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    await waitFor(() => expect(replaySpan).toHaveBeenCalledTimes(2));
+    const secondKey = vi.mocked(replaySpan).mock.calls[1]?.[3];
+    expect(secondKey).toEqual(expect.any(String));
+    expect(secondKey).toMatch(UUID_PATTERN);
+    expect(secondKey).not.toBe(firstKey);
+    expect(replaySpan).toHaveBeenNthCalledWith(2, 'trace-2', 'span-2', {
+      confirm: true,
+      overrides: {},
+    }, secondKey);
+  });
+
+  it('切换 traceId/spanId 后清除旧 API 错误，下一次提交不复用旧幂等键', async () => {
+    vi.mocked(replaySpan)
+      .mockRejectedValueOnce(new Error('第一次重放失败'))
+      .mockResolvedValueOnce(completedResult);
+    const user = userEvent.setup();
+    const { rerender } = renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('第一次重放失败');
+    const firstKey = vi.mocked(replaySpan).mock.calls[0]?.[3];
+    expect(firstKey).toMatch(UUID_PATTERN);
+
+    const nextSpan = { ...llmSpan, id: 'span-2', trace_id: 'trace-2' };
+    rerender(<MemoryRouter><ReplayStudio traceId="trace-2" span={nextSpan} /></MemoryRouter>);
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText('第一次重放失败')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '重放输出' })).not.toBeInTheDocument();
+
+    await ensureReplayConfirmed(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    await waitFor(() => expect(replaySpan).toHaveBeenCalledTimes(2));
+    const secondKey = vi.mocked(replaySpan).mock.calls[1]?.[3];
+    expect(secondKey).toEqual(expect.any(String));
+    expect(secondKey).toMatch(UUID_PATTERN);
+    expect(secondKey).not.toBe(firstKey);
+    expect(replaySpan).toHaveBeenNthCalledWith(2, 'trace-2', 'span-2', {
+      confirm: true,
+      overrides: {},
+    }, secondKey);
+  });
+
   it('完成后展示原始与重放输出、相等性、相似度、diff、归因提示及新 Trace 链接', async () => {
     const user = userEvent.setup();
     renderStudio();
@@ -234,6 +373,78 @@ describe('ReplayStudio 真实重放交互', () => {
     expect(screen.getByRole('link', { name: '查看重放 Trace' })).toHaveAttribute('href', '/traces/replay-trace-1');
   });
 
+  it('原始内容、重放内容、推理和 diff 中的凭证全部经 UI 脱敏', async () => {
+    const rawSecrets = [
+      'source-content-secret',
+      'sk-replay-content-123456',
+      'sk-source-reasoning-123456',
+      'replay-reasoning-secret',
+      'diff-source-secret',
+      'sk-diff-replay-123456',
+    ];
+    const sourceSpan: Span = {
+      ...llmSpan,
+      content: '原始答案 Bearer source-content-secret',
+      reasoning: '原始推理 sk-source-reasoning-123456',
+      output: { content: '原始答案 Bearer source-content-secret' },
+    };
+    const replayResultSpan: Span = {
+      ...llmSpan,
+      id: 'sensitive-replay-span',
+      trace_id: replayTrace.id,
+      content: '重放答案 sk-replay-content-123456',
+      reasoning: '重放推理 Bearer replay-reasoning-secret',
+      output: { content: '重放答案 sk-replay-content-123456' },
+    };
+    vi.mocked(replaySpan).mockResolvedValue({
+      ...completedResult,
+      replay_trace: { ...replayTrace, output: replayResultSpan.output },
+      replay_span: replayResultSpan,
+      source_span: sourceSpan,
+      comparison: {
+        ...completedResult.comparison,
+        content_diff: [
+          '--- 原始输出',
+          '+++ 重放输出',
+          '@@ -1 +1 @@',
+          '-原始答案 Bearer diff-source-secret',
+          '+重放答案 sk-diff-replay-123456',
+        ].join('\n'),
+      },
+    });
+    const user = userEvent.setup();
+    renderStudio(sourceSpan);
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    expect(await screen.findByText('原始答案 Bearer [已隐藏]')).toBeInTheDocument();
+    expect(screen.getByText('重放答案 [已隐藏]')).toBeInTheDocument();
+    expect(screen.getByText('原始推理 [已隐藏]')).toBeInTheDocument();
+    expect(screen.getByText('重放推理 Bearer [已隐藏]')).toBeInTheDocument();
+    const diff = screen.getByText(/@@ -1 \+1 @@/);
+    expect(diff).toHaveTextContent('-原始答案 Bearer [已隐藏]');
+    expect(diff).toHaveTextContent('+重放答案 [已隐藏]');
+    expect(screen.getAllByText(/\[已隐藏\]/).length).toBeGreaterThanOrEqual(5);
+    for (const secret of rawSecrets) {
+      expect(document.body).not.toHaveTextContent(secret);
+    }
+  });
+
+  it('API 错误中的 Bearer 与 sk 凭证同样脱敏且不泄露原文', async () => {
+    vi.mocked(replaySpan).mockRejectedValue(
+      new Error('上游返回 Bearer api-error-secret 与 sk-api-error-123456'),
+    );
+    const user = userEvent.setup();
+    renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('上游返回 Bearer [已隐藏] 与 [已隐藏]');
+    expect(document.body).not.toHaveTextContent('api-error-secret');
+    expect(document.body).not.toHaveTextContent('sk-api-error-123456');
+  });
+
   it('API 拒绝时展示后端错误且不渲染伪造的重放结果', async () => {
     vi.mocked(replaySpan).mockRejectedValue(new Error('历史请求无法安全重建'));
     const user = userEvent.setup();
@@ -242,6 +453,12 @@ describe('ReplayStudio 真实重放交互', () => {
     await user.click(screen.getByRole('button', { name: '开始真实重放' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('历史请求无法安全重建');
+    expect(screen.queryByRole('heading', { name: '重放输出' })).not.toBeInTheDocument();
+    expect(screen.queryByText('重放答案')).not.toBeInTheDocument();
+    expect(screen.queryByText('内容不同')).not.toBeInTheDocument();
+    expect(screen.queryByText('推理不同')).not.toBeInTheDocument();
+    expect(screen.queryByText(/内容相似度/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/@@ -1 \+1 @@/)).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: '查看重放 Trace' })).not.toBeInTheDocument();
     expect(replaySpan).toHaveBeenCalledTimes(1);
   });
