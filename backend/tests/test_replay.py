@@ -317,6 +317,44 @@ async def test_capture_keeps_each_llm_input_and_output_independent(client, opena
 
 
 @pytest.mark.asyncio
+async def test_capture_saves_effective_routed_payload_and_caller_model_on_llm_span(
+    client, openai_upstream
+):
+    trace_id = "replay-capture-current-route"
+    caller_model = "demo-capture-current-route"
+    target_model = "capture-current-routed-model"
+    caller_payload = {
+        "model": caller_model,
+        "messages": [{"role": "user", "content": "记录实际路由后的请求"}],
+        "temperature": 0.3,
+    }
+    await configure_default_upstream(client, openai_upstream)
+    await create_route(
+        client,
+        openai_upstream,
+        name="采集当前路由有效载荷",
+        match_model=caller_model,
+        target_model=target_model,
+    )
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json=caller_payload,
+        headers={"X-AgentTrace-Id": trace_id},
+    )
+
+    assert response.status_code == 200
+    expected = deepcopy(caller_payload)
+    expected["model"] = target_model
+    assert len(openai_upstream.requests) == 1
+    assert openai_upstream.requests[0]["payload"] == expected
+    detail = (await client.get(f"/api/traces/{trace_id}")).json()
+    llm = next(span for span in detail["spans"] if span["kind"] == "llm")
+    assert llm["input"] == expected
+    assert llm["metadata"]["requested_model"] == caller_model
+
+
+@pytest.mark.asyncio
 async def test_capture_saves_sse_request_and_normalized_response_on_llm_span(
     client, openai_upstream
 ):
@@ -443,8 +481,16 @@ async def test_replay_reuses_exact_payload_applies_whitelist_and_current_route_k
     expected["model"] = "current-routed-model"
     assert upstream["payload"] == expected
     assert upstream["headers"]["authorization"] == "Bearer current-route-secret"
-    assert response.json()["replay_span"]["input"] == expected
-    assert response.json()["replay_trace"]["metadata"]["replay"]["overrides"] == overrides
+    body = response.json()
+    assert body["replay_span"]["input"] == expected
+    assert body["replay_trace"]["metadata"]["replay"]["overrides"] == overrides
+    replay_detail = (
+        await client.get(f"/api/traces/{body['replay_trace']['id']}")
+    ).json()
+    persisted_replay_span = next(
+        span for span in replay_detail["spans"] if span["id"] == body["replay_span"]["id"]
+    )
+    assert persisted_replay_span["input"] == expected
 
 
 @pytest.mark.asyncio
@@ -479,6 +525,7 @@ async def test_replay_returns_full_lineage_and_output_diff_without_mutating_sour
     response = await post_replay(client, "replay-lineage-source")
 
     assert response.status_code == 201
+    assert len(openai_upstream.requests) == 1
     assert openai_upstream.requests[-1]["payload"]["model"] == "current-from-original"
     body = response.json()
     assert set(body) == {"replay_trace", "replay_span", "source_span", "comparison"}
@@ -491,6 +538,9 @@ async def test_replay_returns_full_lineage_and_output_diff_without_mutating_sour
     assert replay_trace["parent_id"] == "replay-lineage-source"
     assert replay_span["trace_id"] == replay_trace["id"]
     assert replay_span["kind"] == "llm"
+    assert replay_span["output"]["choices"][0]["message"]["tool_calls"] == [
+        WEATHER_TOOL_CALL
+    ]
     assert body["source_span"]["id"] == "source-llm"
     comparison = body["comparison"]
     assert comparison["status"] == "different"
@@ -512,6 +562,10 @@ async def test_replay_returns_full_lineage_and_output_diff_without_mutating_sour
 
     replay_detail = (await client.get(f"/api/traces/{replay_trace['id']}")).json()
     assert replay_detail["trace"] == replay_trace
+    replay_kinds = [span["kind"] for span in replay_detail["spans"]]
+    assert replay_kinds.count("llm") == 1
+    assert "tool" not in replay_kinds
+    assert "tool_result" not in replay_kinds
     persisted_replay_span = next(
         span for span in replay_detail["spans"] if span["id"] == replay_span["id"]
     )
@@ -1152,3 +1206,14 @@ async def test_replay_preserves_sse_mode_and_persists_normalized_stream_output(
     assert body["comparison"]["reasoning_equal"] is True
     assert body["comparison"]["tool_calls_equal"] is True
     assert body["comparison"]["content_similarity"] == 1.0
+    replay_detail = (
+        await client.get(f"/api/traces/{body['replay_trace']['id']}")
+    ).json()
+    persisted_replay_span = next(
+        span for span in replay_detail["spans"] if span["id"] == body["replay_span"]["id"]
+    )
+    assert persisted_replay_span["output"] == original_stream
+    assert persisted_replay_span["content"] == body["replay_span"]["content"]
+    assert persisted_replay_span["reasoning"] == body["replay_span"]["reasoning"]
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        assert persisted_replay_span[field] == body["replay_span"][field]
