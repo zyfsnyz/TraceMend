@@ -28,4 +28,16 @@ describe('回放控制交互', () => {
     expect(screen.getByText('3 / 3')).toBeInTheDocument();
     expect(screen.getByText('步骤 3')).toBeInTheDocument();
   });
+
+  it('可通过下拉框直接跳转到指定 Span', async () => {
+    const user = userEvent.setup();
+    const onActiveChange = vi.fn();
+    render(<ReplayBar spans={spans} onActiveChange={onActiveChange} />);
+
+    await user.selectOptions(screen.getByRole('combobox', { name: '跳转 Span' }), 's3');
+
+    expect(screen.getByText('3 / 3')).toBeInTheDocument();
+    expect(screen.getByText('步骤 3')).toBeInTheDocument();
+    expect(onActiveChange).toHaveBeenLastCalledWith('s3');
+  });
 });
