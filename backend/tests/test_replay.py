@@ -1,4 +1,5 @@
 from copy import deepcopy
+from uuid import uuid4
 
 import pytest
 
@@ -188,10 +189,25 @@ async def seed_source(
     return payload
 
 
-async def post_replay(client, trace_id, span_id="source-llm", body=None):
+GENERATE_IDEMPOTENCY_KEY = object()
+
+
+async def post_replay(
+    client,
+    trace_id,
+    span_id="source-llm",
+    body=None,
+    idempotency_key=GENERATE_IDEMPOTENCY_KEY,
+):
+    if idempotency_key is GENERATE_IDEMPOTENCY_KEY:
+        idempotency_key = str(uuid4())
+    headers = (
+        {} if idempotency_key is None else {"Idempotency-Key": idempotency_key}
+    )
     return await client.post(
         f"/api/traces/{trace_id}/spans/{span_id}/replay",
         json={"confirm": True} if body is None else body,
+        headers=headers,
     )
 
 
@@ -433,6 +449,107 @@ async def test_replay_returns_full_lineage_and_output_diff_without_mutating_sour
     routes = (await client.get("/api/gateway/routes")).json()["items"]
     current_route = next(item for item in routes if item["id"] == route["id"])
     assert current_route["circuit"]["status"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_replay_idempotent_retry_returns_persisted_response_without_new_trace(
+    client, openai_upstream
+):
+    source_trace_id = "replay-idempotent-retry-source"
+    replay_trace_id = str(uuid4())
+    request_body = {"confirm": True, "overrides": {"temperature": 0.2}}
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={"model": "safe-model", "messages": [{"role": "user", "content": "重试"}]},
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    first = await post_replay(
+        client,
+        source_trace_id,
+        body=request_body,
+        idempotency_key=replay_trace_id,
+    )
+    retry = await post_replay(
+        client,
+        source_trace_id,
+        body=request_body,
+        idempotency_key=replay_trace_id,
+    )
+
+    assert first.status_code == 201
+    assert retry.status_code == first.status_code
+    first_body = first.json()
+    assert first_body["replay_trace"]["id"] == replay_trace_id
+    assert retry.json() == first_body
+    assert len(openai_upstream.requests) == 1
+
+    listing = await client.get("/api/traces", params={"page_size": 200})
+    assert listing.status_code == 200
+    replay_traces = [
+        trace
+        for trace in listing.json()["items"]
+        if trace["parent_id"] == source_trace_id
+    ]
+    assert [trace["id"] for trace in replay_traces] == [replay_trace_id]
+
+
+@pytest.mark.asyncio
+async def test_replay_idempotency_key_conflict_skips_second_upstream_call(
+    client, openai_upstream
+):
+    source_trace_id = "replay-idempotent-conflict-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={"model": "safe-model", "messages": [{"role": "user", "content": "冲突"}]},
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    first = await post_replay(
+        client,
+        source_trace_id,
+        body={"confirm": True, "overrides": {"temperature": 0.2}},
+        idempotency_key=replay_trace_id,
+    )
+    conflict = await post_replay(
+        client,
+        source_trace_id,
+        body={"confirm": True, "overrides": {"temperature": 0.9}},
+        idempotency_key=replay_trace_id,
+    )
+
+    assert first.status_code == 201
+    assert conflict.status_code == 409
+    assert len(openai_upstream.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "idempotency_key",
+    [None, "not-a-uuid"],
+    ids=["missing", "malformed"],
+)
+async def test_replay_requires_uuid_idempotency_key_before_upstream(
+    client, openai_upstream, idempotency_key
+):
+    await seed_source(
+        client,
+        "replay-idempotency-key-validation",
+        span_input={"model": "safe-model", "messages": [{"role": "user", "content": "校验"}]},
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    response = await post_replay(
+        client,
+        "replay-idempotency-key-validation",
+        idempotency_key=idempotency_key,
+    )
+
+    assert response.status_code == 422
+    assert openai_upstream.requests == []
 
 
 @pytest.mark.asyncio
