@@ -1,7 +1,14 @@
+import asyncio
+import socket
+import threading
+import time
 from copy import deepcopy
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+import uvicorn
+from fastapi import FastAPI, Request
 
 pytest_plugins = ["upstream_fixtures"]
 
@@ -58,6 +65,66 @@ WEATHER_TOOL_CALL = {
     "function": {"name": "weather", "arguments": '{"city":"北京"}'},
 }
 ATTRIBUTION_NOTE = "单次一致或差异均不能单独证明模型随机性或幻觉成因；请结合多次实验与事实评估。"
+
+
+@pytest.fixture
+def controlled_openai_upstream():
+    """Real local upstream with a test-controlled async gate and no tool calls."""
+    application = FastAPI()
+    requests = []
+    request_arrived = threading.Event()
+    release = threading.Event()
+    release.set()
+
+    @application.post("/v1/chat/completions")
+    async def completions(request: Request):
+        payload = await request.json()
+        requests.append({"payload": payload, "headers": dict(request.headers)})
+        request_arrived.set()
+        await asyncio.to_thread(release.wait)
+        return {
+            "id": "chatcmpl-controlled",
+            "object": "chat.completion",
+            "model": payload.get("model"),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "无工具重放回答",
+                        "reasoning_content": "仅重放所选 LLM",
+                        "tool_calls": [],
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+        }
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    config = uvicorn.Config(application, log_level="error", access_log=False)
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    while not server.started and time.time() < deadline:
+        time.sleep(0.01)
+    if not server.started:
+        raise RuntimeError("受控本地上游启动失败")
+    try:
+        yield SimpleNamespace(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            requests=requests,
+            request_arrived=request_arrived,
+            release=release,
+        )
+    finally:
+        release.set()
+        server.should_exit = True
+        thread.join(timeout=10)
 
 
 def chat_output(
@@ -376,6 +443,7 @@ async def test_replay_reuses_exact_payload_applies_whitelist_and_current_route_k
     expected["model"] = "current-routed-model"
     assert upstream["payload"] == expected
     assert upstream["headers"]["authorization"] == "Bearer current-route-secret"
+    assert response.json()["replay_span"]["input"] == expected
     assert response.json()["replay_trace"]["metadata"]["replay"]["overrides"] == overrides
 
 
@@ -444,7 +512,15 @@ async def test_replay_returns_full_lineage_and_output_diff_without_mutating_sour
 
     replay_detail = (await client.get(f"/api/traces/{replay_trace['id']}")).json()
     assert replay_detail["trace"] == replay_trace
-    assert replay_span["id"] in {span["id"] for span in replay_detail["spans"]}
+    persisted_replay_span = next(
+        span for span in replay_detail["spans"] if span["id"] == replay_span["id"]
+    )
+    assert persisted_replay_span == replay_span
+    persisted_lineage = replay_detail["trace"]["metadata"]["replay"]
+    assert replay_detail["trace"]["parent_id"] == "replay-lineage-source"
+    assert persisted_lineage["source_trace_id"] == "replay-lineage-source"
+    assert persisted_lineage["source_span_id"] == "source-llm"
+    assert persisted_lineage["comparison"] == comparison
     assert (await client.get("/api/traces/replay-lineage-source")).json() == source_before
     routes = (await client.get("/api/gateway/routes")).json()["items"]
     current_route = next(item for item in routes if item["id"] == route["id"])
@@ -485,6 +561,78 @@ async def test_replay_idempotent_retry_returns_persisted_response_without_new_tr
     assert retry.json() == first_body
     assert len(openai_upstream.requests) == 1
 
+    listing = await client.get("/api/traces", params={"page_size": 200})
+    assert listing.status_code == 200
+    replay_traces = [
+        trace
+        for trace in listing.json()["items"]
+        if trace["parent_id"] == source_trace_id
+    ]
+    assert [trace["id"] for trace in replay_traces] == [replay_trace_id]
+
+
+@pytest.mark.asyncio
+async def test_replay_same_key_while_upstream_running_returns_409_without_duplicate(
+    client, controlled_openai_upstream
+):
+    source_trace_id = "replay-inflight-idempotency-source"
+    replay_trace_id = str(uuid4())
+    request_body = {"confirm": True, "overrides": {"temperature": 0.2}}
+    controlled_openai_upstream.release.clear()
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "inflight-model",
+            "messages": [{"role": "user", "content": "仍在执行"}],
+        },
+    )
+    await configure_default_upstream(client, controlled_openai_upstream)
+
+    first_task = asyncio.create_task(
+        post_replay(
+            client,
+            source_trace_id,
+            body=request_body,
+            idempotency_key=replay_trace_id,
+        )
+    )
+    arrival_task = asyncio.create_task(
+        asyncio.to_thread(controlled_openai_upstream.request_arrived.wait)
+    )
+    try:
+        done, _ = await asyncio.wait(
+            {first_task, arrival_task},
+            timeout=5,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if first_task in done:
+            early_response = first_task.result()
+            assert early_response.status_code == 201, early_response.text
+        assert arrival_task in done, "首个重放未在上游门控前到达"
+
+        conflict = await asyncio.wait_for(
+            post_replay(
+                client,
+                source_trace_id,
+                body=request_body,
+                idempotency_key=replay_trace_id,
+            ),
+            timeout=5,
+        )
+        assert conflict.status_code == 409
+        assert len(controlled_openai_upstream.requests) == 1
+    finally:
+        controlled_openai_upstream.release.set()
+        controlled_openai_upstream.request_arrived.set()
+        first = await asyncio.wait_for(first_task, timeout=5)
+        if not arrival_task.done():
+            arrival_task.cancel()
+        await asyncio.gather(arrival_task, return_exceptions=True)
+
+    assert first.status_code == 201
+    assert first.json()["replay_trace"]["id"] == replay_trace_id
+    assert len(controlled_openai_upstream.requests) == 1
     listing = await client.get("/api/traces", params={"page_size": 200})
     assert listing.status_code == 200
     replay_traces = [
@@ -593,6 +741,63 @@ async def test_replay_rejects_non_llm_span_before_upstream(client, openai_upstre
 
 
 @pytest.mark.asyncio
+async def test_replay_selected_llm_does_not_replay_other_llm_or_tool_spans(
+    client, controlled_openai_upstream
+):
+    source_trace_id = "replay-selected-llm-only-source"
+    selected_input = {
+        "model": "selected-model",
+        "messages": [{"role": "user", "content": "只重放这次调用"}],
+    }
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input=selected_input,
+        span_output=chat_output(content="选中调用的历史回答", reasoning="历史推理"),
+        extra_spans=[
+            {
+                "id": "other-llm",
+                "sequence": 1,
+                "kind": "llm",
+                "name": "另一个历史 LLM 调用",
+                "status": "completed",
+                "input": {
+                    "model": "other-model",
+                    "messages": [{"role": "user", "content": "不应重放"}],
+                },
+                "output": chat_output(content="另一个回答", model="other-model"),
+                "content": "另一个回答",
+                "reasoning": "原始推理",
+            },
+            {
+                "id": "source-tool",
+                "sequence": 2,
+                "kind": "tool",
+                "name": "历史工具调用",
+                "status": "completed",
+                "input": {"city": "北京"},
+                "output": {"temperature": 25},
+                "tool_name": "weather",
+            },
+        ],
+    )
+    await configure_default_upstream(client, controlled_openai_upstream)
+
+    response = await post_replay(client, source_trace_id)
+
+    assert response.status_code == 201
+    assert len(controlled_openai_upstream.requests) == 1
+    assert controlled_openai_upstream.requests[0]["payload"] == selected_input
+    body = response.json()
+    assert body["replay_span"]["output"]["choices"][0]["message"]["tool_calls"] == []
+    replay_detail = (
+        await client.get(f"/api/traces/{body['replay_trace']['id']}")
+    ).json()
+    assert [span["kind"] for span in replay_detail["spans"]] == ["llm"]
+    assert replay_detail["spans"][0] == body["replay_span"]
+
+
+@pytest.mark.asyncio
 async def test_replay_rejects_span_from_another_trace(client, openai_upstream):
     await seed_source(client, "replay-cross-source-a", span_id="span-in-a")
     await seed_source(client, "replay-cross-source-b", span_id="span-in-b")
@@ -602,6 +807,41 @@ async def test_replay_rejects_span_from_another_trace(client, openai_upstream):
 
     assert response.status_code == 404
     assert response.json() == {"detail": "该 Span 不属于当前链路"}
+    assert openai_upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_missing_span_input_without_legacy_input(
+    client, openai_upstream
+):
+    await seed_source(client, "replay-missing-input-source")
+    await configure_default_upstream(client, openai_upstream)
+
+    response = await post_replay(client, "replay-missing-input-source")
+
+    assert response.status_code == 409
+    assert openai_upstream.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("input_location", ["span", "legacy_trace"])
+async def test_replay_rejects_non_list_messages_before_upstream(
+    client, openai_upstream, input_location
+):
+    invalid_input = {
+        "model": "invalid-messages-model",
+        "messages": {"role": "user", "content": "消息必须是列表"},
+    }
+    source_trace_id = f"replay-non-list-messages-{input_location}"
+    if input_location == "span":
+        await seed_source(client, source_trace_id, span_input=invalid_input)
+    else:
+        await seed_source(client, source_trace_id, trace_input=invalid_input)
+    await configure_default_upstream(client, openai_upstream)
+
+    response = await post_replay(client, source_trace_id)
+
+    assert response.status_code == 409
     assert openai_upstream.requests == []
 
 
@@ -688,6 +928,54 @@ async def test_replay_uses_current_key_not_original_client_credential(client, op
     assert "original-client-secret" not in response.text
     replay_detail = await client.get(f"/api/traces/{response.json()['replay_trace']['id']}")
     assert "original-client-secret" not in replay_detail.text
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_open_current_route_circuit_before_upstream(
+    client, openai_upstream
+):
+    source_trace_id = "replay-open-circuit-source"
+    requested_model = "demo-replay-open"
+    await configure_default_upstream(
+        client,
+        openai_upstream,
+        gateway_failure_threshold=1,
+        gateway_cooldown_seconds=60,
+    )
+    route = await create_route(
+        client,
+        openai_upstream,
+        name="重放时已熔断的当前路由",
+        match_model=requested_model,
+        target_model="denied-model",
+    )
+    trip = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": requested_model,
+            "messages": [{"role": "user", "content": "通过公开网关触发熔断"}],
+        },
+        headers={"X-AgentTrace-Id": "replay-open-circuit-trip"},
+    )
+    assert trip.status_code == 429
+    routes = (await client.get("/api/gateway/routes")).json()["items"]
+    current_route = next(item for item in routes if item["id"] == route["id"])
+    assert current_route["circuit"]["status"] == "open"
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "denied-model",
+            "messages": [{"role": "user", "content": "熔断时不能发送"}],
+        },
+        span_metadata={"requested_model": requested_model},
+    )
+    before_replay = len(openai_upstream.requests)
+
+    response = await post_replay(client, source_trace_id)
+
+    assert response.status_code == 503
+    assert len(openai_upstream.requests) == before_replay
 
 
 @pytest.mark.asyncio
@@ -784,28 +1072,50 @@ async def test_replay_rejects_credentials_in_historical_payload(
 async def test_replay_persists_upstream_failure_as_auditable_201_attempt(
     client, openai_upstream
 ):
+    source_trace_id = "replay-upstream-failure-source"
+    replay_trace_id = str(uuid4())
     failed_input = {"model": "denied-model", "messages": [{"role": "user", "content": "失败"}]}
-    await seed_source(client, "replay-upstream-failure-source", span_input=failed_input)
+    await seed_source(client, source_trace_id, span_input=failed_input)
     await configure_default_upstream(client, openai_upstream)
 
-    response = await post_replay(client, "replay-upstream-failure-source")
-
+    response = await post_replay(
+        client,
+        source_trace_id,
+        idempotency_key=replay_trace_id,
+    )
     assert response.status_code == 201
+    retry = await post_replay(
+        client,
+        source_trace_id,
+        idempotency_key=replay_trace_id,
+    )
+
+    assert retry.status_code == 201
     body = response.json()
+    assert retry.json() == body
+    assert len(openai_upstream.requests) == 1
+    assert body["replay_trace"]["id"] == replay_trace_id
+    assert body["replay_trace"]["parent_id"] == source_trace_id
     assert body["comparison"]["status"] == "failed"
     assert body["replay_trace"]["status"] == "failed"
     assert body["replay_span"]["status"] == "failed"
     assert body["replay_span"]["input"] == failed_input
     assert body["replay_span"]["output"] == {"error": {"message": "上游限流"}}
     assert body["replay_span"]["error"]["status_code"] == 429
-    assert body["replay_trace"]["metadata"]["replay"]["comparison"]["status"] == "failed"
+    lineage = body["replay_trace"]["metadata"]["replay"]
+    assert lineage["source_trace_id"] == source_trace_id
+    assert lineage["source_span_id"] == "source-llm"
+    assert lineage["comparison"] == body["comparison"]
+    assert lineage["comparison"]["status"] == "failed"
     replay_id = body["replay_trace"]["id"]
     persisted = (await client.get(f"/api/traces/{replay_id}")).json()
-    assert persisted["trace"]["id"] == replay_id
+    assert persisted["trace"] == body["replay_trace"]
+    assert persisted["trace"]["id"] == replay_trace_id
     assert persisted["trace"]["status"] == "failed"
     failed_span = next(
         span for span in persisted["spans"] if span["id"] == body["replay_span"]["id"]
     )
+    assert failed_span == body["replay_span"]
     assert failed_span["error"]["status_code"] == 429
 
 
