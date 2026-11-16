@@ -9,6 +9,7 @@ import { stringifySafe } from '../lib/sensitive';
 import { ErrorState, JsonBlock, Spinner, StatusBadge } from '../components/ui';
 import { TraceDAG } from '../components/TraceDAG';
 import { ReplayBar } from '../components/ReplayBar';
+import { ReplayStudio } from '../components/ReplayStudio';
 import { SpanInspector } from '../components/SpanInspector';
 import { TraceTimeline } from '../components/TraceTimeline';
 import { FindingsPanel } from '../components/FindingsPanel';
@@ -106,6 +107,7 @@ export function TraceDetailPage() {
       <section className="panel min-w-0 overflow-hidden"><div className="panel-header"><div><h2 className="panel-title">执行 DAG</h2><p className="mt-1 text-[11px] text-slate-400">按父子关系连线；无父子关系时按 sequence 时序连接</p></div><div className="hidden items-center gap-3 text-[10px] text-slate-400 md:flex"><span className="flex items-center gap-1"><i className="h-2 w-2 rounded-full bg-violet-400" />模型</span><span className="flex items-center gap-1"><i className="h-2 w-2 rounded-full bg-amber-400" />工具</span><span className="flex items-center gap-1"><i className="h-2 w-2 rounded-full bg-teal-400" />当前节点</span></div></div><TraceDAG spans={spans} findings={findings} selectedSpanId={selectedSpanId} onSelect={setSelectedSpanId} /><ReplayBar spans={spans} activeSpanId={selectedSpanId} onActiveChange={setSelectedSpanId} /></section>
       <section className="panel min-w-0 overflow-hidden"><div className="panel-header"><div><h2 className="panel-title">Span 详情</h2><p className="mt-1 text-[11px] text-slate-400">与 DAG、时间线和回放同步</p></div>{selectedSpan && <span className="font-mono text-[10px] text-teal-700">已选中</span>}</div><SpanInspector span={selectedSpan} /></section>
     </div>
+    <div className="mt-5"><ReplayStudio traceId={traceId} span={selectedSpan} /></div>
     <section className="panel mt-5 overflow-hidden"><div className="panel-header"><div><h2 className="panel-title">执行时间线</h2><p className="mt-1 text-[11px] text-slate-400">按 sequence 排列，点击任意步骤可同步定位</p></div><span className="text-xs text-slate-400">{spans.length} 步</span></div><TraceTimeline spans={spans} selectedSpanId={selectedSpanId} onSelect={setSelectedSpanId} /></section>
     <div className="mt-5 grid items-start gap-5 xl:grid-cols-2"><section id="findings" className="panel scroll-mt-5 overflow-hidden"><div className="panel-header"><div><h2 className="panel-title">风险发现与证据</h2><p className="mt-1 text-[11px] text-slate-400">严重度、解释与原始 evidence 可逐项复核</p></div><span className="badge border-orange-200 bg-orange-50 text-orange-700">{findings.length} 项</span></div><FindingsPanel findings={findings} onLocate={locateSpan} /></section><section className="panel overflow-hidden"><div className="panel-header"><div><h2 className="panel-title">审计评论</h2><p className="mt-1 text-[11px] text-slate-400">协作记录复核结论，支持待处理与已解决</p></div><span className="badge border-slate-200 bg-slate-50 text-slate-500">{comments.filter((comment) => comment.status === 'open').length} 待处理</span></div><CommentsPanel traceId={traceId} selectedSpanId={selectedSpanId} comments={comments} onChanged={() => load(false)} /></section></div>
   </div>;

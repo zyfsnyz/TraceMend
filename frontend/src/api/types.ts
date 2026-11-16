@@ -50,6 +50,36 @@ export interface Span {
   metadata: Record<string, JsonValue>;
 }
 
+export interface ReplayOverrides {
+  model?: string;
+  temperature?: number;
+  top_p?: number;
+  seed?: number;
+  max_tokens?: number;
+}
+
+export interface ReplaySpanRequest {
+  confirm: true;
+  overrides: ReplayOverrides;
+}
+
+export interface ReplayComparison {
+  status: 'equal' | 'different';
+  content_equal: boolean;
+  reasoning_equal: boolean;
+  tool_calls_equal: boolean;
+  content_similarity: number;
+  content_diff: string;
+  attribution_note: string;
+}
+
+export interface ReplaySpanResult {
+  replay_trace: Trace;
+  replay_span: Span;
+  source_span: Span;
+  comparison: ReplayComparison;
+}
+
 export interface Finding {
   id: string;
   span_id: string | null;

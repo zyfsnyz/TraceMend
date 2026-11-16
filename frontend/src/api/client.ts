@@ -1,7 +1,7 @@
 import { getAdminKey, UNAUTHORIZED_EVENT } from '../lib/adminKey';
 import type {
   AppSettings, Comment, ConnectionTestResult, GatewayRoute, GatewayRouteInput,
-  GatewayRouteUpdate, SettingsUpdate, Stats, TraceDetail, TraceFilters, TraceListResponse,
+  GatewayRouteUpdate, ReplaySpanRequest, ReplaySpanResult, SettingsUpdate, Stats, TraceDetail, TraceFilters, TraceListResponse,
 } from './types';
 
 export class ApiError extends Error {
@@ -79,6 +79,20 @@ export function reanalyzeTrace(id: string): Promise<unknown> {
 
 export function llmCheckTrace(id: string): Promise<unknown> {
   return apiFetch(`/api/traces/${encodeURIComponent(id)}/llm-check`, { method: 'POST' });
+}
+
+export function replaySpan(
+  traceId: string,
+  spanId: string,
+  payload: ReplaySpanRequest,
+  idempotencyKey: string,
+): Promise<ReplaySpanResult> {
+  const path = `/api/traces/${encodeURIComponent(traceId)}/spans/${encodeURIComponent(spanId)}/replay`;
+  return apiFetch<ReplaySpanResult>(path, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
+    body: JSON.stringify(payload),
+  });
 }
 
 export function getSettings(): Promise<AppSettings> {

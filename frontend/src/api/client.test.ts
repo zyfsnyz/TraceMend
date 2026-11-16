@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { apiFetch, ApiError, createComment, createGatewayRoute, downloadReport, getSettings, getTraces, llmCheckTrace, patchComment, saveSettings } from './client';
+import { apiFetch, ApiError, createComment, createGatewayRoute, downloadReport, getSettings, getTraces, llmCheckTrace, patchComment, replaySpan, saveSettings } from './client';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -148,6 +148,35 @@ describe('评论、LLM 检测与报告 API 契约', () => {
     await expect(downloadReport('trace-1', 'md')).resolves.toBeUndefined();
 
     expect(anchor?.download).toBe('AgentTrace-trace-1-report.md');
+  });
+});
+
+describe('单 Span 真实重放 API 契约', () => {
+  it('POST 到嵌套 replay 端点，并发送确认、覆盖参数与 UUID 幂等键', async () => {
+    const responseBody = {
+      replay_trace: { id: 'replay-trace-1' },
+      replay_span: { id: 'replay-span-1' },
+      source_span: { id: 'span-1' },
+      comparison: { status: 'different' },
+    };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(responseBody), {
+      status: 201, headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const idempotencyKey = '6d53f47b-37d0-4b5f-b57f-e13bd68f2157';
+    const payload = {
+      confirm: true as const,
+      overrides: { model: 'replay-model', temperature: 0.2, top_p: 0.9, seed: 42, max_tokens: 512 },
+    };
+
+    await expect(replaySpan('trace-1', 'span-1', payload, idempotencyKey)).resolves.toEqual(responseBody);
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/traces/trace-1/spans/span-1/replay', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }));
+    const options = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(new Headers(options.headers).get('Idempotency-Key')).toBe(idempotencyKey);
   });
 });
 

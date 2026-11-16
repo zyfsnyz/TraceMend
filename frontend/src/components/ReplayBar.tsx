@@ -41,6 +41,19 @@ export function ReplayBar({ spans, activeSpanId, onActiveChange }: ReplayBarProp
         <button className="icon-button h-8 w-8" aria-label="下一步" title="下一步" disabled={!ordered.length || state.index >= ordered.length - 1} onClick={() => dispatch({ type: 'next' })}><ChevronRight size={16} /></button>
       </div>
       <input aria-label="回放进度" className="mx-1 min-w-24 flex-1 accent-teal-600" type="range" min={0} max={Math.max(0, ordered.length - 1)} value={Math.min(state.index, Math.max(0, ordered.length - 1))} disabled={!ordered.length} onChange={(event) => dispatch({ type: 'seek', index: Number(event.target.value) })} />
+      <select
+        aria-label="跳转 Span"
+        className="h-8 max-w-44 rounded-lg border border-slate-200 bg-white px-2 text-xs text-slate-600 outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+        value={currentId ?? ''}
+        disabled={!ordered.length}
+        onChange={(event) => {
+          const index = ordered.findIndex((span) => span.id === event.target.value);
+          if (index >= 0) dispatch({ type: 'seek', index });
+        }}
+      >
+        {!ordered.length && <option value="">暂无步骤</option>}
+        {ordered.map((span, index) => <option key={span.id} value={span.id}>{index + 1}. {span.name}</option>)}
+      </select>
       <span className="w-14 text-center font-mono text-xs font-semibold text-slate-600">{ordered.length ? state.index + 1 : 0} / {ordered.length}</span>
       <span className="hidden max-w-44 truncate text-xs text-slate-500 lg:inline" title={current?.name}>{current?.name ?? '暂无可回放步骤'}</span>
     </div>
