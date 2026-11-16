@@ -8,6 +8,8 @@ import { ReplayStudio } from './ReplayStudio';
 
 vi.mock('../api/client', () => ({ replaySpan: vi.fn() }));
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const llmSpan: Span = {
   id: 'span-1',
   trace_id: 'trace-1',
@@ -119,7 +121,7 @@ describe('ReplayStudio 真实重放交互', () => {
     await waitFor(() => expect(replaySpan).toHaveBeenCalledWith('trace-1', 'span-1', {
       confirm: true,
       overrides: {},
-    }));
+    }, expect.any(String)));
   });
 
   it('只发送用户编辑的 model、temperature、top_p、seed、max_tokens 数字或文本覆盖值', async () => {
@@ -149,7 +151,64 @@ describe('ReplayStudio 真实重放交互', () => {
         seed: 42,
         max_tokens: 512,
       },
+    }, expect.any(String)));
+  });
+
+  it('请求待完成时禁止重复提交并显示重放进度', async () => {
+    let resolveReplay!: (result: typeof completedResult) => void;
+    vi.mocked(replaySpan).mockImplementationOnce(() => new Promise<typeof completedResult>((resolve) => {
+      resolveReplay = resolve;
     }));
+    const user = userEvent.setup();
+    renderStudio();
+    await confirmReplay(user);
+    const submit = screen.getByRole('button', { name: '开始真实重放' });
+
+    await user.click(submit);
+
+    expect(replaySpan).toHaveBeenCalledTimes(1);
+    const firstKey = vi.mocked(replaySpan).mock.calls[0]?.[3];
+    expect(firstKey).toEqual(expect.any(String));
+    expect(firstKey).toMatch(UUID_PATTERN);
+    const pendingSubmit = screen.getByRole('button', { name: /重放中/ });
+    expect(pendingSubmit).toBeDisabled();
+
+    await user.click(pendingSubmit);
+
+    expect(replaySpan).toHaveBeenCalledTimes(1);
+    expect(pendingSubmit).toBeDisabled();
+    expect(pendingSubmit).toHaveTextContent(/重放中/);
+
+    resolveReplay(completedResult);
+    expect(await screen.findByRole('heading', { name: '重放输出' })).toBeInTheDocument();
+  });
+
+  it('API 错误后的重试复用完全相同的 UUID 幂等键', async () => {
+    vi.mocked(replaySpan)
+      .mockRejectedValueOnce(new Error('上游服务暂时不可用'))
+      .mockResolvedValueOnce(completedResult);
+    const user = userEvent.setup();
+    renderStudio();
+    await confirmReplay(user);
+
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('上游服务暂时不可用');
+    expect(replaySpan).toHaveBeenCalledTimes(1);
+    const firstKey = vi.mocked(replaySpan).mock.calls[0]?.[3];
+    expect(firstKey).toEqual(expect.any(String));
+    expect(firstKey).toMatch(UUID_PATTERN);
+
+    const retry = screen.getByRole('button', { name: '开始真实重放' });
+    expect(retry).toBeEnabled();
+    await user.click(retry);
+
+    await waitFor(() => expect(replaySpan).toHaveBeenCalledTimes(2));
+    const retryKey = vi.mocked(replaySpan).mock.calls[1]?.[3];
+    expect(retryKey).toEqual(expect.any(String));
+    expect(retryKey).toMatch(UUID_PATTERN);
+    expect(retryKey).toBe(firstKey);
+    expect(await screen.findByRole('heading', { name: '重放输出' })).toBeInTheDocument();
   });
 
   it('完成后展示原始与重放输出、相等性、相似度、diff、归因提示及新 Trace 链接', async () => {
