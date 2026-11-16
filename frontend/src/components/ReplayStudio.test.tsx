@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -70,6 +70,39 @@ const completedResult = {
     content_similarity: 0.42,
     content_diff: ['--- 原始输出', '+++ 重放输出', '@@ -1 +1 @@', '-原始答案', '+重放答案'].join('\n'),
     attribution_note: '单次一致或差异均不能单独证明模型随机性或幻觉成因；请结合多次实验与事实评估。',
+  },
+};
+
+const switchedSpan: Span = {
+  ...llmSpan,
+  id: 'span-2',
+  trace_id: 'trace-2',
+  content: '第二条原始答案',
+  output: { content: '第二条原始答案' },
+};
+
+const switchedResult: typeof completedResult = {
+  replay_trace: {
+    ...replayTrace,
+    id: 'replay-trace-2',
+    parent_id: 'trace-2',
+    input: switchedSpan.input,
+    output: { content: '新实验答案' },
+    metadata: { replay: { source_trace_id: 'trace-2', source_span_id: 'span-2', mode: 'llm_span' } },
+  },
+  replay_span: {
+    ...switchedSpan,
+    id: 'replay-span-2',
+    trace_id: 'replay-trace-2',
+    content: '新实验答案',
+    output: { content: '新实验答案' },
+    reasoning: '新实验推理',
+  },
+  source_span: switchedSpan,
+  comparison: {
+    ...completedResult.comparison,
+    content_similarity: 0.88,
+    content_diff: ['--- 原始输出', '+++ 重放输出', '@@ -1 +1 @@', '-第二条原始答案', '+新实验答案'].join('\n'),
   },
 };
 
@@ -348,6 +381,112 @@ describe('ReplayStudio 真实重放交互', () => {
       confirm: true,
       overrides: {},
     }, secondKey);
+  });
+
+  it('首个请求 pending 时切换 Span，旧请求 late resolve 不覆盖新结果', async () => {
+    let resolveOld!: (result: typeof completedResult) => void;
+    const oldRequest = new Promise<typeof completedResult>((resolve) => {
+      resolveOld = resolve;
+    });
+    vi.mocked(replaySpan)
+      .mockImplementationOnce(() => oldRequest)
+      .mockResolvedValueOnce(switchedResult);
+    const user = userEvent.setup();
+    const { rerender } = renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    expect(replaySpan).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: /重放中/ })).toBeDisabled();
+    const oldKey = vi.mocked(replaySpan).mock.calls[0]?.[3];
+    expect(oldKey).toMatch(UUID_PATTERN);
+
+    rerender(<MemoryRouter><ReplayStudio traceId="trace-2" span={switchedSpan} /></MemoryRouter>);
+
+    expect(screen.queryByRole('button', { name: /重放中/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '重放输出' })).not.toBeInTheDocument();
+    expect(screen.queryByText('重放答案')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: '查看重放 Trace' })).not.toBeInTheDocument();
+
+    await ensureReplayConfirmed(user);
+    const nextSubmit = screen.getByRole('button', { name: '开始真实重放' });
+    expect(nextSubmit).toBeEnabled();
+    await user.click(nextSubmit);
+
+    await waitFor(() => expect(replaySpan).toHaveBeenCalledTimes(2));
+    const nextKey = vi.mocked(replaySpan).mock.calls[1]?.[3];
+    expect(nextKey).toEqual(expect.any(String));
+    expect(nextKey).toMatch(UUID_PATTERN);
+    expect(nextKey).not.toBe(oldKey);
+    expect(replaySpan).toHaveBeenNthCalledWith(2, 'trace-2', 'span-2', {
+      confirm: true,
+      overrides: {},
+    }, nextKey);
+    expect(await screen.findByText('新实验答案')).toBeInTheDocument();
+    expect(screen.getByText('内容相似度：88%')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '查看重放 Trace' })).toHaveAttribute('href', '/traces/replay-trace-2');
+
+    await act(async () => {
+      resolveOld(completedResult);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('新实验答案')).toBeInTheDocument();
+    expect(screen.queryByText('重放答案')).not.toBeInTheDocument();
+    expect(screen.queryByText('原始答案')).not.toBeInTheDocument();
+    expect(screen.getByText('内容相似度：88%')).toBeInTheDocument();
+    expect(screen.queryByText('内容相似度：42%')).not.toBeInTheDocument();
+    const currentDiff = screen.getByText(/@@ -1 \+1 @@/);
+    expect(currentDiff).toHaveTextContent('-第二条原始答案');
+    expect(currentDiff).toHaveTextContent('+新实验答案');
+    expect(currentDiff).not.toHaveTextContent('-原始答案');
+    expect(currentDiff).not.toHaveTextContent('+重放答案');
+    const traceLinks = screen.getAllByRole('link', { name: '查看重放 Trace' });
+    expect(traceLinks).toHaveLength(1);
+    expect(traceLinks[0]).toHaveAttribute('href', '/traces/replay-trace-2');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('首个请求 pending 时切换 Span，旧请求 late reject 不显示旧错误', async () => {
+    let rejectOld!: (reason: Error) => void;
+    const oldRequest = new Promise<typeof completedResult>((_resolve, reject) => {
+      rejectOld = reject;
+    });
+    vi.mocked(replaySpan)
+      .mockImplementationOnce(() => oldRequest)
+      .mockResolvedValueOnce(switchedResult);
+    const user = userEvent.setup();
+    const { rerender } = renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    expect(replaySpan).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: /重放中/ })).toBeDisabled();
+    rerender(<MemoryRouter><ReplayStudio traceId="trace-2" span={switchedSpan} /></MemoryRouter>);
+
+    expect(screen.queryByRole('button', { name: /重放中/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '重放输出' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    await ensureReplayConfirmed(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+    expect(await screen.findByText('新实验答案')).toBeInTheDocument();
+    expect(replaySpan).toHaveBeenNthCalledWith(2, 'trace-2', 'span-2', {
+      confirm: true,
+      overrides: {},
+    }, expect.any(String));
+
+    await act(async () => {
+      rejectOld(new Error('旧请求延迟失败'));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText('旧请求延迟失败')).not.toBeInTheDocument();
+    expect(screen.getByText('新实验答案')).toBeInTheDocument();
+    expect(screen.getByText('内容相似度：88%')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '查看重放 Trace' })).toHaveAttribute('href', '/traces/replay-trace-2');
   });
 
   it('完成后展示原始与重放输出、相等性、相似度、diff、归因提示及新 Trace 链接', async () => {
