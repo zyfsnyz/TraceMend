@@ -1,8 +1,38 @@
-# AgentTrace
+# TraceMend
 
-AgentTrace 是一个中文、本地优先的 Agent 审计工作台：通过透明代理接入 OpenAI 兼容接口与 MCP，也接收任意 Agent 主动上报的 Trace，将一次任务中的提示词、模型输出、工具调用、工具返回、Token、耗时和错误串成可追溯链路，并提供风险证据、DAG、时间线回放、评论和报告导出。
+> **让每一次 Agent 出错，都有迹可循。**
 
-**AgentTrace 不是大模型，也不替代 Agent 或工具。** 它是代理与审计层。默认即可独立使用免费的确定性规则检测；二阶 LLM 检测默认关闭，只有显式配置并调用对应接口时才可能请求外部检测模型。
+**TraceMend（迹修）** 是一个中文、本地优先、可自托管的 **Agent 审计与链路回放工作台**。它把模型调用、工具行为、Token、耗时与错误串成一条能看清、能复盘、能验证的证据链，并让你从历史 LLM Span 发起一次边界明确的重放实验，用新旧输出对比回答：**改了参数以后，结果到底变了什么？**
+
+[核心功能](#功能) · [Replay Studio](#agent-链路回放器--replay-studio) · [快速开始](#快速开始) · [接入指南](#接入) · [验证记录](docs/verification.md)
+
+![TraceMend 中文审计界面：Span 证据与 Replay Studio 单步重放](docs/assets/tracemend-replay-studio.png)
+
+## 为什么是 TraceMend
+
+Agent 的问题往往不是日志里多了一行红色错误，而是“它为什么这样决定、哪一步开始偏离、修改后是否真的更好”。普通日志能告诉你请求发生过，却很难支撑一次完整的调试闭环。
+
+| 调试现场 | TraceMend 提供的抓手 |
+| --- | --- |
+| 多轮模型与工具调用交织，看不清执行顺序 | Trace / Span DAG、时间线、原始输入输出与耗时统一呈现 |
+| 工具报错、空结果、重复调用或回答缺少依据 | 免费确定性规则给出可复核的 Finding 与证据位置，不替人下事实结论 |
+| 只想复盘历史，不想再烧一次 Token | ReplayBar 按 Span 播放、暂停、前后跳转，全程不请求模型、不执行工具 |
+| 怀疑模型或采样参数有问题，却只能靠复制 Prompt 重试 | Replay Studio 从历史 LLM Span 重建请求，在当前路由上重放并生成 unified diff |
+| 重试网络抖动，担心重复扣费或覆盖实验 | 服务端幂等预占与结果快照保证同键同体重试返回原结果，不再次请求上游 |
+| 复盘后要归档、讨论或交接 | 评论、解决状态、中文 Markdown / PDF 报告保留完整证据 |
+
+**它不只是“把 Trace 画出来”，而是把「发现异常 → 定位证据 → 重放单步 → 对比结果 → 留档」连成一条可操作的调试路径。** 这是本项目现阶段的产品组合方向，不声称全球首创，也不把单次对比包装成自动归因或自动修复。
+
+## 适合谁
+
+- 正在调试 LangChain、LangGraph、自定义 ReAct 或工作流 Agent 的开发者；
+- 需要在本地保留 prompt、工具参数和审计证据的个人与小团队；
+- 想用 OpenAI 兼容代理、MCP 或 REST ingest 接入，而不愿被某个 Agent 框架绑定的项目；
+- 需要中文可视化复盘、实验血缘和报告导出的教学、竞赛与工程验证场景。
+
+**TraceMend = Trace + Mend：先还原证据，再验证修正。** 产品原名 AgentTrace；为保持已有部署与接入兼容，`X-AgentTrace-Id`、数据库文件名、环境变量和浏览器存储键仍保留原名称。
+
+**TraceMend 不是大模型，也不替代 Agent 或工具。** 它是代理与审计层。默认即可独立使用免费的确定性规则检测；二阶 LLM 检测默认关闭，只有显式配置并调用对应接口时才可能请求外部检测模型。真实重放只针对一个 LLM Span，可能产生上游费用，不会执行工具或恢复完整 Agent 链路。
 
 ## 功能
 
@@ -10,13 +40,27 @@ AgentTrace 是一个中文、本地优先的 Agent 审计工作台：通过透�
 - **网页连接设置**：在“连接设置”中配置默认模型、MCP 与二阶检测模型，保存后立即生效；密钥只写入被 Git 忽略的本地 `.env`，API 不回显。
 - **轻量模型网关**：按模型名称和通配符匹配多条上游规则，支持优先级、408/425/429/5xx/网络错误自动切换、连续失败熔断、每日 Token 预算和按配置价格估算 USD 成本。
 - **MCP 代理**：转发 JSON-RPC，记录 `initialize`、`tools/list`、`tools/call` 及工具结果或错误。
-- **框架无关接入**：自定义 Agent 可直接 `POST /api/traces/ingest`，无需安装 AgentTrace SDK。
+- **框架无关接入**：自定义 Agent 可直接 `POST /api/traces/ingest`，无需安装专用 SDK。
 - **免费规则检测**：工具异常、空工具结果、参数/schema 问题、同名同参数重复调用、声明来源但无来源证据、工具证据未支撑的数字、明确状态冲突。
 - **审计工作台**：搜索和筛选、链路 DAG、时间线与单步回放、原始输入/输出、Finding 证据、评论与解决状态。
+- **Agent 链路回放**：零 Token 逐步回放历史 Span；选中单个 LLM Span 后可按当前路由付费重放并比较新旧输出，详见下节。
 - **报告**：导出中文 Markdown 和 PDF 审计报告。
 - **可选二阶 LLM 检测**：与免费规则分来源保存，不参与默认启动和自动分析。
 
 风险 Finding 表示“需要复核的证据”，不代表系统断言内容一定错误；尤其是“未支撑数字”规则。
+
+## Agent 链路回放器 / Replay Studio
+
+链路详情页提供两种互补的回放方式：
+
+- **零 Token 逐步回放（ReplayBar）**：按 Span `sequence` 播放、暂停、前后跳转或直接选择步骤，并同步 DAG、时间线与 Span 详情。它只读取已保存的审计记录，不请求模型、不执行工具，也不还原真实墙钟耗时。
+- **单步 LLM 真实重放（Replay Studio）**：选中一个 LLM Span，确认可能产生费用后，使用**当前保存的路由与密钥**重新请求该次 `chat/completions`，可覆盖 `model/temperature/top_p/seed/max_tokens`。只重放所选 LLM Span；不会执行返回的 `tool_calls`、不重放其他 Span，也不恢复完整链路。历史请求的 URL 与客户端凭据不会被复用。
+
+每次真实重放都必须携带 UUID 格式的 `Idempotency-Key`，重放 Trace 的 ID 为该键（按 UUID 规范化）。相同键与相同请求体重试会返回已保存结果，不重复请求上游；执行中或请求体变化会返回 409。重放遵守每日 Token 预算和当前路由的熔断/可重试回退（408/425/429/5xx/网络错误）：预算用尽返回 429，所有候选路由均处于熔断冷却期返回 503。
+
+对比结果标记为 `same`、`different` 或 `failed`，逐项给出 content、reasoning、tool_calls 是否一致，以及内容相似度和 unified diff。进入上游调用后的 HTTP/网络/SSE 失败仍以 201 返回 failed Trace、failed Span、failed 对比和网关尝试记录，便于审计与幂等重试。界面展示与报告导出会隐藏常见密钥与 Bearer/`sk-` 字符串；历史请求顶层若含凭据字段会拒绝重放（409）。
+
+使用方式：打开“审计链路”→ 进入任一 Trace → 用 DAG 下方的回放条零 Token 逐步查看 → 在 DAG、时间线或步骤下拉中选中 LLM Span → 在 Replay Studio 填写可选覆盖参数并确认费用 → 查看新旧输出、差异和归因提示，必要时跳转到独立的重放 Trace。单次一致或差异不能单独证明模型随机性或幻觉成因，需结合多次实验与事实评估。接口字段、状态码和安全边界见 [API 数据契约](docs/api-contract.md)。
 
 ## 架构
 
@@ -133,7 +177,7 @@ python scripts/seed_demo.py
 
 - 对 408、425、429、5xx 和网络错误尝试下一路由；其他 4xx（含 400、401、403、404）不重试。连续失败达到阈值后临时熔断，可在网页手动重置。
 - 认证头转发：路由配置了 `api_key` 时使用该密钥覆盖客户端 `Authorization`，并清除 `api-key`、`x-api-key`、Cookie、token/secret/signature 等其他客户端凭据头。只有首个候选路由可在未配置密钥时透传调用方凭据；故障切换到后续候选时一律清除这些凭据，备用路由需要自己的 `api_key`，避免跨服务商泄露。`DEFAULT_UPSTREAM_KEY` 只作用于默认上游，且仅当客户端未提供 `Authorization` 或使用保留占位 `agenttrace` 时替换；显式 `X-Upstream-Base` 直连始终原样透传，不注入服务端密钥。
-- 每日预算按 UTC 当天 `[00:00, 次日 00:00)` 内每次 `openai-proxy` LLM Span 的 `total_tokens` 统计，而不是按聚合 Trace 的首次开始时间；跨天复用 Trace ID 不会漏计，未来时间戳也不会计入今天。超出后返回 429，设为 0 表示不限。
+- 每日预算按 UTC 当天 `[00:00, 次日 00:00)` 内每次 `openai-proxy` 或 `replay` LLM Span 的 `total_tokens` 统计，而不是按聚合 Trace 的首次开始时间；跨天复用 Trace ID 不会漏计，未来时间戳也不会计入今天。超出后返回 429，设为 0 表示不限。
 - 成本按实际 usage 与配置的每百万 Token USD 单价估算；未配置价格或上游未返回 usage 时不产生可靠成本值。
 - 流式响应在收到上游响应头前可切换路由；开始向客户端发送 SSE 后不再重试，以免拼接受损响应。下游主动停止或断开会记录未完成 Trace 并完成资源清理，但不会把健康上游计入失败熔断。
 - 当前不包含相同 Prompt 缓存、多用户 Quota 或完整 LiteLLM 协议适配。
@@ -142,7 +186,7 @@ python scripts/seed_demo.py
 
 ### OpenAI Python SDK：只改 `base_url`
 
-将 SDK 的 `base_url` 指向 AgentTrace，并用 `X-Upstream-Base` 选择真实上游；业务代码、模型名和消息结构不变。API key 会先发送给所配置的 AgentTrace，再转发给上游，因此只应使用可信实例；连接远程实例必须使用 TLS（`https`）。
+将 SDK 的 `base_url` 指向 TraceMend，并用 `X-Upstream-Base` 选择真实上游；业务代码、模型名和消息结构不变。API key 会先发送给所配置的 TraceMend，再转发给上游，因此只应使用可信实例；连接远程实例必须使用 TLS（`https`）。
 
 ```python
 import os
@@ -185,7 +229,7 @@ llm = ChatOpenAI(
 print(llm.invoke("你好").content)
 ```
 
-流式调用仍使用 LangChain 原有的 `.stream(...)`；AgentTrace 在转发 SSE 的同时记录链路。
+流式调用仍使用 LangChain 原有的 `.stream(...)`；TraceMend 在转发 SSE 的同时记录链路。
 
 ### MCP：`X-MCP-Upstream`
 
@@ -260,6 +304,7 @@ curl -X POST http://127.0.0.1:8000/api/traces/ingest \
 | `POST /api/traces/{id}/comments` | 针对 Trace 添加评论/标注 |
 | `PATCH /api/comments/{id}` | 更新评论内容或 `open/resolved` 状态 |
 | `POST /api/traces/{id}/reanalyze` | 重新运行免费规则 |
+| `POST /api/traces/{id}/spans/{span_id}/replay` | 单步 LLM 真实重放；需 UUID `Idempotency-Key`，可能产生费用，详见 API 契约 |
 | `POST /api/traces/{id}/llm-check` | 显式执行可选二阶 LLM 检测；未启用/未配置返回 409 |
 | `GET /api/traces/{id}/report.md` | 下载 Markdown 报告 |
 | `GET /api/traces/{id}/report.pdf` | 下载 PDF 报告 |
@@ -340,9 +385,9 @@ PDF 报告内嵌 Noto Sans SC 字体子集，字体文件位于 `backend/assets/
 
 ## License
 
-MIT License
+[MIT License](LICENSE)
 
-Copyright (c) 2026 AgentTrace contributors
+Copyright (c) 2026 TraceMend contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
