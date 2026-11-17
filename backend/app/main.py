@@ -14,6 +14,7 @@ from .gateway import CircuitRegistry
 from .gateway_api import router as gateway_router
 from .mcp import router as mcp_router
 from .proxy import router as proxy_router
+from .replay import router as replay_router
 from .settings_api import router as settings_router
 
 
@@ -26,7 +27,7 @@ def create_app() -> FastAPI:
     settings = config.Settings(_env_file=config.env_files())
     engine = make_engine(settings.db_url)
     Base.metadata.create_all(engine)
-    application = FastAPI(title="AgentTrace", version="0.2.0")
+    application = FastAPI(title="TraceMend", version="0.2.0")
     application.state.settings = settings
     application.state.env_path = config.PROJECT_ENV
     application.state.bootstrap_env_path = config.BOOTSTRAP_ENV
@@ -43,6 +44,7 @@ def create_app() -> FastAPI:
     application.include_router(router)
     application.include_router(settings_router)
     application.include_router(gateway_router)
+    application.include_router(replay_router)
     application.include_router(proxy_router)
     application.include_router(mcp_router)
 

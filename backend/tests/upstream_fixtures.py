@@ -94,3 +94,63 @@ def openai_upstream():
     yield SimpleNamespace(base_url=f"http://127.0.0.1:{port}/v1", requests=requests)
     server.should_exit = True
     thread.join(timeout=10)
+
+
+@pytest.fixture
+def controlled_openai_upstream():
+    """Real local upstream with a test-controlled async gate and no tool calls."""
+    application = FastAPI()
+    requests = []
+    request_arrived = threading.Event()
+    release = threading.Event()
+    release.set()
+
+    @application.post("/v1/chat/completions")
+    async def completions(request: Request):
+        payload = await request.json()
+        requests.append({"payload": payload, "headers": dict(request.headers)})
+        request_arrived.set()
+        await asyncio.to_thread(release.wait)
+        return {
+            "id": "chatcmpl-controlled",
+            "object": "chat.completion",
+            "model": payload.get("model"),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "无工具重放回答",
+                        "reasoning_content": "仅重放所选 LLM",
+                        "tool_calls": [],
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+        }
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    config = uvicorn.Config(application, log_level="error", access_log=False)
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    while not server.started and time.time() < deadline:
+        time.sleep(0.01)
+    if not server.started:
+        raise RuntimeError("受控本地上游启动失败")
+    try:
+        yield SimpleNamespace(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            requests=requests,
+            request_arrived=request_arrived,
+            release=release,
+        )
+    finally:
+        release.set()
+        server.should_exit = True
+        thread.join(timeout=10)

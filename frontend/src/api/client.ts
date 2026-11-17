@@ -139,7 +139,7 @@ export async function downloadReport(id: string, format: 'md' | 'pdf'): Promise<
   if (!response.ok) throw await errorFromResponse(response);
   const disposition = response.headers.get('Content-Disposition') ?? '';
   const matched = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(disposition)?.[1];
-  const fallback = `AgentTrace-${id.slice(0, 8)}-report.${format}`;
+  const fallback = `TraceMend-${id.slice(0, 8)}-report.${format}`;
   let filename = fallback;
   if (matched) {
     try {

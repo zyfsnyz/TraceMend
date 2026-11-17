@@ -38,7 +38,7 @@ export function AppLayout() {
       <aside className="relative z-20 flex shrink-0 flex-col border-r border-white/[.04] bg-[#111b28] text-slate-300 lg:fixed lg:inset-y-0 lg:left-0 lg:w-[232px]">
         <div className="flex h-[76px] items-center gap-3 border-b border-white/[.07] px-5">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-teal-300/20 bg-teal-400/10 text-teal-300 shadow-[0_0_24px_rgba(45,212,191,.06)]"><Activity size={21} strokeWidth={2.2} /></div>
-          <div><div className="text-[17px] font-semibold tracking-[-0.02em] text-white">AgentTrace</div><div className="mt-0.5 text-[10px] tracking-wide text-slate-500">Agent 审计溯源平台</div></div>
+          <div><div className="text-[17px] font-semibold tracking-[-0.02em] text-white">TraceMend</div><div className="mt-0.5 text-[10px] tracking-wide text-slate-500">Agent 审计与链路回放</div></div>
         </div>
         <nav ref={navRef} aria-label="主导航" className="nav-scroll flex gap-1 overflow-x-auto p-3 lg:mt-3 lg:flex-col lg:overflow-visible lg:px-3">
           <p className="hidden px-3.5 pb-2 pt-1 text-[10px] font-medium uppercase tracking-[0.14em] text-slate-600 lg:block">工作区</p>

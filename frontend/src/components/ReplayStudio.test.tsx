@@ -123,6 +123,7 @@ async function ensureReplayConfirmed(user: ReturnType<typeof userEvent.setup>) {
 describe('ReplayStudio 真实重放交互', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(replaySpan).mockReset();
     vi.mocked(replaySpan).mockResolvedValue(completedResult);
   });
 
@@ -153,6 +154,14 @@ describe('ReplayStudio 真实重放交互', () => {
     expect(screen.getByText(/真实重放会请求上游模型.*可能产生费用/)).toBeInTheDocument();
     expect(screen.getByText(/不(会)?执行工具/)).toBeInTheDocument();
     expect(screen.getByText(/不(会)?恢复完整链路/)).toBeInTheDocument();
+  });
+
+  it('当前 Span 名称中的 Bearer 与 sk 凭证会脱敏', () => {
+    renderStudio({ ...llmSpan, name: '生成 Bearer studio-name-secret 与 sk-studio-name-123456' });
+
+    expect(screen.getByText('当前 Span：生成 Bearer [已隐藏] 与 [已隐藏]')).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent('studio-name-secret');
+    expect(document.body).not.toHaveTextContent('sk-studio-name-123456');
   });
 
   it('必须确认费用风险后才能提交，未编辑时发送空 overrides', async () => {
@@ -317,6 +326,74 @@ describe('ReplayStudio 真实重放交互', () => {
     expect(retryKey).toMatch(UUID_PATTERN);
     expect(retryKey).toBe(firstKey);
     expect(await screen.findByRole('heading', { name: '重放输出' })).toBeInTheDocument();
+  });
+
+  it('结果出现后锁定参数与提交，必须新实验才能再次编辑', async () => {
+    const user = userEvent.setup();
+    renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+    expect(await screen.findByRole('heading', { name: '重放输出' })).toBeInTheDocument();
+
+    expect(screen.getByLabelText('model')).toBeDisabled();
+    expect(screen.getByLabelText('temperature')).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: /确认.*可能产生费用/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '开始真实重放' })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: '新实验' }));
+
+    expect(screen.getByLabelText('model')).toBeEnabled();
+    expect(screen.getByLabelText('temperature')).toBeEnabled();
+    expect(screen.getByRole('checkbox', { name: /确认.*可能产生费用/ })).not.toBeChecked();
+    expect(screen.getByRole('button', { name: '开始真实重放' })).toBeDisabled();
+  });
+
+  it('API 错误后点击新实验会清除错误并使用新的 UUID', async () => {
+    vi.mocked(replaySpan)
+      .mockRejectedValueOnce(new Error('上游服务暂时不可用'))
+      .mockResolvedValueOnce(completedResult);
+    const user = userEvent.setup();
+    renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('上游服务暂时不可用');
+    const firstKey = vi.mocked(replaySpan).mock.calls[0]?.[3];
+    expect(firstKey).toMatch(UUID_PATTERN);
+
+    await user.click(screen.getByRole('button', { name: '新实验' }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    await ensureReplayConfirmed(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    await waitFor(() => expect(replaySpan).toHaveBeenCalledTimes(2));
+    const secondKey = vi.mocked(replaySpan).mock.calls[1]?.[3];
+    expect(secondKey).toMatch(UUID_PATTERN);
+    expect(secondKey).not.toBe(firstKey);
+  });
+
+  it('API 错误后修改 override 会作为新请求使用新 UUID', async () => {
+    vi.mocked(replaySpan)
+      .mockRejectedValueOnce(new Error('历史请求无法安全重建'))
+      .mockResolvedValueOnce(completedResult);
+    const user = userEvent.setup();
+    renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('历史请求无法安全重建');
+    const firstKey = vi.mocked(replaySpan).mock.calls[0]?.[3];
+    expect(firstKey).toMatch(UUID_PATTERN);
+
+    await user.type(screen.getByLabelText('temperature'), '0.7');
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    await waitFor(() => expect(replaySpan).toHaveBeenCalledTimes(2));
+    const secondKey = vi.mocked(replaySpan).mock.calls[1]?.[3];
+    expect(secondKey).toMatch(UUID_PATTERN);
+    expect(secondKey).not.toBe(firstKey);
+    expect(replaySpan).toHaveBeenNthCalledWith(2, 'trace-1', 'span-1', {
+      confirm: true,
+      overrides: { temperature: 0.7 },
+    }, secondKey);
   });
 
   it('切换 traceId/spanId 后清除旧结果，下一次提交使用新 ID 和新的 UUID', async () => {
@@ -510,6 +587,85 @@ describe('ReplayStudio 真实重放交互', () => {
     expect(diff).toHaveTextContent('+重放答案');
     expect(screen.getByText(completedResult.comparison.attribution_note)).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '查看重放 Trace' })).toHaveAttribute('href', '/traces/replay-trace-1');
+  });
+
+  it('same 对比状态明确显示一致', async () => {
+    vi.mocked(replaySpan).mockResolvedValue({
+      ...completedResult,
+      replay_trace: { ...replayTrace, output: { content: '原始答案' } },
+      replay_span: {
+        ...completedResult.replay_span,
+        content: '原始答案',
+        reasoning: '原始推理',
+        output: { content: '原始答案' },
+      },
+      comparison: {
+        ...completedResult.comparison,
+        status: 'same' as const,
+        content_equal: true,
+        reasoning_equal: true,
+        tool_calls_equal: true,
+        content_similarity: 1,
+        content_diff: '',
+      },
+    });
+    const user = userEvent.setup();
+    renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    expect(await screen.findByText('对比状态：一致')).toBeInTheDocument();
+    expect(screen.getByText('内容一致')).toBeInTheDocument();
+    expect(screen.getByText('推理一致')).toBeInTheDocument();
+    expect(screen.getByText('内容相似度：100%')).toBeInTheDocument();
+    expect(screen.queryByText('对比状态：不同')).not.toBeInTheDocument();
+  });
+
+  it('failed 的 201 结果展示脱敏上游错误与审计链接，而不是伪装成内容不同', async () => {
+    const upstreamError = {
+      status_code: 429,
+      body: { error: { message: '上游限流 Bearer failed-secret' } },
+    };
+    vi.mocked(replaySpan).mockResolvedValue({
+      ...completedResult,
+      replay_trace: {
+        ...replayTrace,
+        id: 'replay-trace-failed',
+        status: 'error',
+        output: { error: upstreamError.body.error },
+      },
+      replay_span: {
+        ...llmSpan,
+        id: 'replay-span-failed',
+        trace_id: 'replay-trace-failed',
+        status: 'error',
+        content: null,
+        reasoning: null,
+        output: { error: upstreamError.body.error },
+        error: upstreamError,
+      },
+      comparison: {
+        ...completedResult.comparison,
+        status: 'failed' as const,
+        content_equal: false,
+        reasoning_equal: false,
+        tool_calls_equal: false,
+        content_similarity: 0,
+        content_diff: '',
+      },
+    });
+    const user = userEvent.setup();
+    renderStudio();
+    await confirmReplay(user);
+    await user.click(screen.getByRole('button', { name: '开始真实重放' }));
+
+    expect(await screen.findByText('对比状态：重放失败')).toBeInTheDocument();
+    expect(screen.queryByText('对比状态：不同')).not.toBeInTheDocument();
+    expect(screen.getByText(/"status_code": 429/)).toBeInTheDocument();
+    expect(screen.getByText(/上游限流 Bearer \[已隐藏\]/)).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent('failed-secret');
+    expect(screen.getByRole('link', { name: '查看重放 Trace' })).toHaveAttribute('href', '/traces/replay-trace-failed');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('原始内容、重放内容、推理和 diff 中的凭证全部经 UI 脱敏', async () => {

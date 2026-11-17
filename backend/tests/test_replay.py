@@ -1,4 +1,5 @@
 import asyncio
+import json
 import socket
 import threading
 import time
@@ -9,6 +10,7 @@ from uuid import uuid4
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 pytest_plugins = ["upstream_fixtures"]
 
@@ -68,37 +70,59 @@ ATTRIBUTION_NOTE = "单次一致或差异均不能单独证明模型随机性或
 
 
 @pytest.fixture
-def controlled_openai_upstream():
-    """Real local upstream with a test-controlled async gate and no tool calls."""
+def scenario_openai_upstream():
+    """Real local upstream that can return 500 or an SSE stream missing [DONE]."""
     application = FastAPI()
     requests = []
-    request_arrived = threading.Event()
-    release = threading.Event()
-    release.set()
 
     @application.post("/v1/chat/completions")
     async def completions(request: Request):
         payload = await request.json()
         requests.append({"payload": payload, "headers": dict(request.headers)})
-        request_arrived.set()
-        await asyncio.to_thread(release.wait)
+        if payload.get("model") == "server-error-model":
+            return JSONResponse(
+                status_code=500, content={"error": {"message": "上游内部错误"}}
+            )
+        if payload.get("model") == "incomplete-sse-model":
+
+            async def generate():
+                chunk = json.dumps(
+                    {"choices": [{"delta": {"content": "未完成"}, "index": 0}]},
+                    ensure_ascii=False,
+                )
+                yield f"data: {chunk}\n\n".encode()
+                await asyncio.sleep(0)
+
+            return StreamingResponse(generate(), media_type="text/event-stream")
+        if payload.get("model") == "inband-error-sse-model":
+
+            async def generate_inband_error():
+                event = {
+                    "error": {
+                        "message": "上游流内错误",
+                        "type": "upstream_stream_error",
+                        "code": "bad_gateway_stream",
+                    }
+                }
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+                await asyncio.sleep(0)
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(
+                generate_inband_error(), media_type="text/event-stream"
+            )
         return {
-            "id": "chatcmpl-controlled",
+            "id": "chatcmpl-scenario",
             "object": "chat.completion",
             "model": payload.get("model"),
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "无工具重放回答",
-                        "reasoning_content": "仅重放所选 LLM",
-                        "tool_calls": [],
-                    },
+                    "message": {"role": "assistant", "content": "场景上游回答", "tool_calls": []},
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
         }
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -113,16 +137,10 @@ def controlled_openai_upstream():
     while not server.started and time.time() < deadline:
         time.sleep(0.01)
     if not server.started:
-        raise RuntimeError("受控本地上游启动失败")
+        raise RuntimeError("场景本地上游启动失败")
     try:
-        yield SimpleNamespace(
-            base_url=f"http://127.0.0.1:{port}/v1",
-            requests=requests,
-            request_arrived=request_arrived,
-            release=release,
-        )
+        yield SimpleNamespace(base_url=f"http://127.0.0.1:{port}/v1", requests=requests)
     finally:
-        release.set()
         server.should_exit = True
         thread.join(timeout=10)
 
@@ -276,6 +294,23 @@ async def post_replay(
         json={"confirm": True} if body is None else body,
         headers=headers,
     )
+
+
+def reservation_state(application, idempotency_key):
+    from app.models import ReplayReservation
+
+    with application.state.session_factory() as session:
+        row = session.get(ReplayReservation, str(idempotency_key))
+        if row is None:
+            return None
+        return {
+            "status": row.status,
+            "request_fingerprint": row.request_fingerprint,
+            "source_trace_id": row.source_trace_id,
+            "source_span_id": row.source_span_id,
+            "response_json": deepcopy(row.response_json),
+            "error": deepcopy(row.error),
+        }
 
 
 @pytest.mark.asyncio
@@ -1247,3 +1282,1334 @@ async def test_replay_preserves_sse_mode_and_persists_normalized_stream_output(
     assert persisted_replay_span["prompt_tokens"] == 20
     assert persisted_replay_span["completion_tokens"] == 9
     assert persisted_replay_span["total_tokens"] == 29
+
+
+async def route_states(client):
+    response = await client.get("/api/gateway/routes")
+    assert response.status_code == 200
+    return {item["id"]: item for item in response.json()["items"]}
+
+
+@pytest.mark.asyncio
+async def test_replay_usage_consumes_daily_budget_for_a_new_replay_key(
+    client, openai_upstream
+):
+    await configure_default_upstream(
+        client, openai_upstream, gateway_daily_token_budget=10
+    )
+    await seed_source(
+        client,
+        "replay-budget-replay-source",
+        span_input={
+            "model": "budget-replay-model",
+            "messages": [{"role": "user", "content": "预算计算"}],
+        },
+    )
+
+    first = await post_replay(client, "replay-budget-replay-source")
+
+    assert first.status_code == 201
+    assert first.json()["replay_span"]["total_tokens"] == 18
+    assert len(openai_upstream.requests) == 1
+
+    second = await post_replay(client, "replay-budget-replay-source")
+
+    assert second.status_code == 429
+    assert "预算" in second.json()["detail"]
+    assert len(openai_upstream.requests) == 1
+    stats = (await client.get("/api/stats")).json()
+    assert stats["today_tokens"] == 18
+    assert stats["daily_token_budget"] == 10
+
+
+@pytest.mark.asyncio
+async def test_replay_retries_next_route_after_retryable_error_and_opens_circuit(
+    client, openai_upstream, scenario_openai_upstream
+):
+    await configure_default_upstream(
+        client,
+        openai_upstream,
+        gateway_failure_threshold=1,
+        gateway_cooldown_seconds=60,
+    )
+    first = await create_route(
+        client,
+        scenario_openai_upstream,
+        name="故障主路由",
+        match_model="demo-*",
+        target_model="server-error-model",
+        api_key="primary-route-key",
+        priority=1,
+    )
+    second = await create_route(
+        client,
+        openai_upstream,
+        name="健康备用路由",
+        match_model="demo-*",
+        target_model="fallback-model",
+        api_key="fallback-route-key",
+        priority=2,
+    )
+    await seed_source(
+        client,
+        "replay-fallback-source",
+        span_input={
+            "model": "demo-fallback",
+            "messages": [{"role": "user", "content": "回退到备用路由"}],
+        },
+    )
+
+    response = await post_replay(client, "replay-fallback-source")
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["replay_trace"]["status"] == "completed"
+    assert body["replay_span"]["status"] == "completed"
+    assert body["replay_span"]["output"]["model"] == "fallback-model"
+    assert len(scenario_openai_upstream.requests) == 1
+    primary_request = scenario_openai_upstream.requests[0]
+    assert primary_request["payload"]["model"] == "server-error-model"
+    assert primary_request["headers"]["authorization"] == "Bearer primary-route-key"
+    assert len(openai_upstream.requests) == 1
+    fallback_request = openai_upstream.requests[0]
+    assert fallback_request["payload"]["model"] == "fallback-model"
+    assert fallback_request["headers"]["authorization"] == "Bearer fallback-route-key"
+    gateway = body["replay_trace"]["metadata"]["gateway"]
+    attempts = gateway["attempts"]
+    assert [item["outcome"] for item in attempts] == ["retry", "success"]
+    assert attempts[0]["route_id"] == first["id"]
+    assert attempts[0]["status_code"] == 500
+    assert attempts[1]["route_id"] == second["id"]
+    assert gateway["route_id"] == second["id"]
+
+    routes = await route_states(client)
+    assert routes[first["id"]]["circuit"]["status"] == "open"
+    assert routes[second["id"]]["circuit"]["status"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_replay_connect_error_records_circuit_failure_and_falls_back(
+    client, openai_upstream
+):
+    await configure_default_upstream(
+        client,
+        openai_upstream,
+        gateway_failure_threshold=1,
+        gateway_cooldown_seconds=60,
+    )
+    first = await create_route(
+        client,
+        SimpleNamespace(base_url="http://127.0.0.1:1/v1"),
+        name="离线主路由",
+        match_model="demo-*",
+        target_model="offline-model",
+        priority=1,
+    )
+    await create_route(
+        client,
+        openai_upstream,
+        name="在线备用路由",
+        match_model="demo-*",
+        target_model="fallback-model",
+        priority=2,
+    )
+    await seed_source(
+        client,
+        "replay-network-fallback-source",
+        span_input={
+            "model": "demo-network",
+            "messages": [{"role": "user", "content": "网络失败回退"}],
+        },
+    )
+
+    response = await post_replay(client, "replay-network-fallback-source")
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["replay_trace"]["status"] == "completed"
+    assert body["replay_span"]["output"]["model"] == "fallback-model"
+    assert len(openai_upstream.requests) == 1
+    attempts = body["replay_trace"]["metadata"]["gateway"]["attempts"]
+    assert attempts[0]["outcome"] == "retry"
+    assert attempts[0]["error_type"] == "ConnectError"
+    assert attempts[0]["status_code"] is None
+    assert attempts[-1]["outcome"] == "success"
+
+    routes = await route_states(client)
+    assert routes[first["id"]]["circuit"]["status"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_replay_failure_counts_reach_circuit_threshold_then_skip_route(
+    client, openai_upstream, scenario_openai_upstream
+):
+    await configure_default_upstream(
+        client,
+        openai_upstream,
+        gateway_failure_threshold=2,
+        gateway_cooldown_seconds=60,
+    )
+    first = await create_route(
+        client,
+        scenario_openai_upstream,
+        name="两次失败后熔断的主路由",
+        match_model="demo-*",
+        target_model="server-error-model",
+        priority=1,
+    )
+    await create_route(
+        client,
+        openai_upstream,
+        name="始终健康的备用路由",
+        match_model="demo-*",
+        target_model="fallback-model",
+        priority=2,
+    )
+    await seed_source(
+        client,
+        "replay-circuit-threshold-source",
+        span_input={
+            "model": "demo-threshold",
+            "messages": [{"role": "user", "content": "累计失败"}],
+        },
+    )
+
+    for expected_failures in (1, 2):
+        response = await post_replay(client, "replay-circuit-threshold-source")
+        assert response.status_code == 201
+        assert response.json()["replay_trace"]["status"] == "completed"
+        assert len(scenario_openai_upstream.requests) == expected_failures
+        routes = await route_states(client)
+        assert routes[first["id"]]["circuit"]["failures"] == expected_failures
+
+    routes = await route_states(client)
+    assert routes[first["id"]]["circuit"]["status"] == "open"
+
+    skipped = await post_replay(client, "replay-circuit-threshold-source")
+
+    assert skipped.status_code == 201
+    body = skipped.json()
+    assert body["replay_trace"]["status"] == "completed"
+    assert body["replay_trace"]["metadata"]["gateway"]["attempts"][0]["outcome"] == (
+        "circuit_open"
+    )
+    assert len(scenario_openai_upstream.requests) == 2
+    assert len(openai_upstream.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_replay_incomplete_sse_records_failure_and_does_not_retry(
+    client, openai_upstream, scenario_openai_upstream
+):
+    await configure_default_upstream(
+        client,
+        openai_upstream,
+        gateway_failure_threshold=1,
+        gateway_cooldown_seconds=60,
+    )
+    first = await create_route(
+        client,
+        scenario_openai_upstream,
+        name="流未完成主路由",
+        match_model="demo-*",
+        target_model="incomplete-sse-model",
+        priority=1,
+    )
+    await create_route(
+        client,
+        openai_upstream,
+        name="不应重试的备用路由",
+        match_model="demo-*",
+        target_model="fallback-model",
+        priority=2,
+    )
+    await seed_source(
+        client,
+        "replay-incomplete-sse-source",
+        span_input={
+            "model": "demo-stream",
+            "stream": True,
+            "messages": [{"role": "user", "content": "流式未完成"}],
+        },
+    )
+
+    response = await post_replay(client, "replay-incomplete-sse-source")
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["replay_trace"]["status"] == "failed"
+    assert body["replay_span"]["status"] == "failed"
+    assert len(scenario_openai_upstream.requests) == 1
+    assert openai_upstream.requests == []
+    span_error = body["replay_span"]["error"]
+    assert span_error["type"] == "IncompleteStream"
+    assert span_error["message"]
+    assert "status_code" not in span_error
+    assert body["replay_trace"]["error"] == span_error
+    assert body["replay_span"]["metadata"]["upstream_status"] == 200
+    assert body["comparison"]["status"] == "failed"
+    assert body["replay_span"]["content"] == "未完成"
+    attempts = body["replay_trace"]["metadata"]["gateway"]["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "error"
+    assert attempts[0]["status_code"] == 200
+    assert attempts[0]["error_type"] == "IncompleteStream"
+
+    routes = await route_states(client)
+    assert routes[first["id"]]["circuit"]["status"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_replay_sse_http_error_records_status_body_and_failed_comparison(
+    client, openai_upstream
+):
+    await configure_default_upstream(client, openai_upstream)
+    await seed_source(
+        client,
+        "replay-sse-http-error-source",
+        span_input={
+            "model": "denied-html-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "流式 HTTP 失败"}],
+        },
+    )
+
+    response = await post_replay(client, "replay-sse-http-error-source")
+
+    assert response.status_code == 201
+    body = response.json()
+    expected_error = {
+        "status_code": 502,
+        "body": {"content": "<html>Bad Gateway</html>"},
+    }
+    assert body["replay_trace"]["status"] == "failed"
+    assert body["replay_span"]["status"] == "failed"
+    assert body["replay_span"]["error"] == expected_error
+    assert body["replay_trace"]["error"] == expected_error
+    assert body["replay_span"]["metadata"]["upstream_status"] == 502
+    assert body["comparison"]["status"] == "failed"
+    assert len(openai_upstream.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "variant",
+    ["source", "comparison", "idempotency_key", "parent", "span_count"],
+)
+async def test_replay_rejects_client_forged_idempotent_record(
+    client, openai_upstream, variant
+):
+    from app.replay import request_fingerprint
+    from app.schemas import ReplayRequest
+
+    source_trace_id = "replay-forged-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "伪造幂等记录"}],
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+    fingerprint = request_fingerprint(
+        source_trace_id, "source-llm", ReplayRequest(confirm=True)
+    )
+    lineage = {
+        "source_trace_id": source_trace_id,
+        "source_span_id": "source-llm",
+        "request_fingerprint": fingerprint,
+        "idempotency_key": replay_trace_id,
+        "mode": "llm_span",
+        "comparison": {
+            "status": "same",
+            "content_equal": True,
+            "reasoning_equal": True,
+            "tool_calls_equal": True,
+            "content_similarity": 1.0,
+            "content_diff": "",
+            "attribution_note": ATTRIBUTION_NOTE,
+        },
+    }
+    forged_source = "replay"
+    forged_parent = source_trace_id
+    forged_output = chat_output(content="伪造回答")
+    forged_spans = [
+        {
+            "id": "forged-llm",
+            "sequence": 0,
+            "kind": "llm",
+            "name": "伪造的 LLM",
+            "status": "completed",
+            "input": {"model": "safe-model", "messages": []},
+            "output": forged_output,
+            "content": "伪造回答",
+        }
+    ]
+    if variant == "source":
+        forged_source = "custom-agent"
+    elif variant == "comparison":
+        lineage.pop("comparison")
+    elif variant == "idempotency_key":
+        lineage["idempotency_key"] = str(uuid4())
+    elif variant == "parent":
+        forged_parent = "replay-forged-other-parent"
+    elif variant == "span_count":
+        forged_spans.append(
+            {
+                "id": "forged-llm-two",
+                "sequence": 1,
+                "kind": "llm",
+                "name": "第二个伪造 LLM",
+                "status": "completed",
+                "content": "伪造回答二",
+            }
+        )
+    forged = {
+        "trace": {
+            "id": replay_trace_id,
+            "parent_id": forged_parent,
+            "name": "伪造重放记录",
+            "source": forged_source,
+            "status": "completed",
+            "model": "forged-model",
+            "input": {"messages": []},
+            "output": forged_output,
+            "metadata": {"replay": lineage},
+        },
+        "spans": forged_spans,
+    }
+    ingested = await client.post("/api/traces/ingest", json=forged)
+    assert ingested.status_code == 200
+
+    response = await post_replay(
+        client, source_trace_id, idempotency_key=replay_trace_id
+    )
+
+    assert response.status_code == 409
+    assert "伪造回答" not in response.text
+    assert openai_upstream.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "credential_key",
+    [
+        "token",
+        "key",
+        "auth",
+        "bearer",
+        "admin_key",
+        "passwd",
+        "accessToken",
+        "apiKey",
+        "AdminKey",
+        " access_token ",
+        "X-Api-Key",
+        "auth-token",
+        "api_token",
+        "apiToken",
+        "accessKeyId",
+        "access_key_id",
+        "authKey",
+        "auth_key",
+        "sessionKey",
+        "session_key",
+        "x-api-token",
+        "user_token",
+        "signing_key_id",
+        "oauth_auth",
+    ],
+)
+async def test_replay_rejects_expanded_top_level_credential_keys(
+    client, application, openai_upstream, credential_key
+):
+    from sqlalchemy import select
+
+    from app.models import ReplayReservation
+
+    source_trace_id = f"replay-credential-expanded-{uuid4().hex}"
+    secret = "persisted-client-secret-value"
+    unsafe_input = {
+        "model": "safe-model",
+        "messages": [{"role": "user", "content": "历史凭据扩展"}],
+        credential_key: secret,
+    }
+    await seed_source(client, source_trace_id, span_input=unsafe_input)
+    await configure_default_upstream(client, openai_upstream)
+
+    response = await post_replay(client, source_trace_id)
+
+    assert response.status_code == 409
+    assert secret not in response.text
+    assert openai_upstream.requests == []
+    listing = (await client.get("/api/traces", params={"page_size": 200})).json()
+    assert not [item for item in listing["items"] if item["parent_id"] == source_trace_id]
+    with application.state.session_factory() as session:
+        assert session.scalar(
+            select(ReplayReservation.idempotency_key).where(
+                ReplayReservation.source_trace_id == source_trace_id
+            )
+        ) is None
+
+
+@pytest.mark.asyncio
+async def test_replay_allows_legitimate_top_level_parameter_keys(client, openai_upstream):
+    safe_input = {
+        "model": "safe-legit-model",
+        "messages": [{"role": "user", "content": "合法参数"}],
+        "max_tokens": 64,
+        "max_completion_tokens": 128,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "presence_penalty": 0.1,
+        "frequency_penalty": 0.2,
+        "seed": 7,
+        "user": "audit-user",
+        "stop": ["END"],
+        "n": 1,
+        "response_format": {"type": "json_object"},
+    }
+    await seed_source(client, "replay-legit-parameters", span_input=safe_input)
+    await configure_default_upstream(client, openai_upstream)
+
+    response = await post_replay(client, "replay-legit-parameters")
+
+    assert response.status_code == 201
+    assert openai_upstream.requests[-1]["payload"] == safe_input
+
+
+@pytest.mark.asyncio
+async def test_replay_uses_trace_input_when_span_input_lacks_messages(
+    client, openai_upstream
+):
+    legacy_input = {
+        "model": "legacy-empty-span-model",
+        "messages": [{"role": "user", "content": "空 Span 输入回退"}],
+        "temperature": 0.3,
+    }
+    await seed_source(
+        client,
+        "replay-empty-span-input",
+        span_input={},
+        trace_input=legacy_input,
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    response = await post_replay(client, "replay-empty-span-input")
+
+    assert response.status_code == 201
+    assert openai_upstream.requests[-1]["payload"] == legacy_input
+    body = response.json()
+    assert body["replay_span"]["input"] == legacy_input
+    assert (
+        body["replay_trace"]["metadata"]["replay"]["request_source"]
+        == "legacy_single_llm_trace"
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_persist_failure_marks_reservation_terminal_and_retry_returns_failure(
+    client, openai_upstream, monkeypatch
+):
+    source_trace_id = "replay-persist-failure-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "持久化失败"}],
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    def broken_persist(*args, **kwargs):
+        raise RuntimeError("forced persist failure")
+
+    monkeypatch.setattr("app.replay.persist_openai_trace", broken_persist)
+
+    with pytest.raises(RuntimeError, match="forced persist failure"):
+        await post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+
+    retry = await post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+
+    assert retry.status_code == 201
+    body = retry.json()
+    assert body["replay_trace"]["id"] == replay_trace_id
+    assert body["replay_trace"]["status"] == "failed"
+    assert body["replay_span"]["status"] == "failed"
+    assert body["replay_span"]["error"]["type"] == "RuntimeError"
+    assert body["comparison"]["status"] == "failed"
+    assert len(openai_upstream.requests) == 1
+
+    persisted = (await client.get(f"/api/traces/{replay_trace_id}")).json()
+    assert persisted["trace"]["status"] == "failed"
+    assert persisted["trace"]["parent_id"] == source_trace_id
+    assert persisted["trace"]["metadata"]["replay"]["idempotency_key"] == replay_trace_id
+    assert len([span for span in persisted["spans"] if span["kind"] == "llm"]) == 1
+
+
+def forged_replay_shape(source_trace_id, replay_trace_id, fingerprint):
+    """A fully valid replay record shape a client could POST to /api/traces/ingest."""
+    forged_output = chat_output(content="伪造回答")
+    lineage = {
+        "source_trace_id": source_trace_id,
+        "source_span_id": "source-llm",
+        "request_fingerprint": fingerprint,
+        "idempotency_key": replay_trace_id,
+        "mode": "llm_span",
+        "comparison": {
+            "status": "same",
+            "content_equal": True,
+            "reasoning_equal": True,
+            "tool_calls_equal": True,
+            "content_similarity": 1.0,
+            "content_diff": "",
+            "attribution_note": ATTRIBUTION_NOTE,
+        },
+    }
+    return {
+        "trace": {
+            "id": replay_trace_id,
+            "parent_id": source_trace_id,
+            "name": "LLM 单 Span 重放",
+            "source": "replay",
+            "status": "completed",
+            "model": "forged-model",
+            "input": {"model": "safe-model", "messages": []},
+            "output": forged_output,
+            "metadata": {"replay": lineage},
+        },
+        "spans": [
+            {
+                "id": "forged-llm",
+                "sequence": 0,
+                "kind": "llm",
+                "name": "伪造的 LLM",
+                "status": "completed",
+                "input": {"model": "safe-model", "messages": []},
+                "output": forged_output,
+                "content": "伪造回答",
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_preingested_fully_shaped_forgery_with_zero_upstream(
+    client, application, openai_upstream
+):
+    from app.replay import request_fingerprint
+    from app.schemas import ReplayRequest
+
+    source_trace_id = "replay-forged-shape-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "伪造完整形状"}],
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+    fingerprint = request_fingerprint(
+        source_trace_id, "source-llm", ReplayRequest(confirm=True)
+    )
+    forged = forged_replay_shape(source_trace_id, replay_trace_id, fingerprint)
+    ingested = await client.post("/api/traces/ingest", json=forged)
+    assert ingested.status_code == 200
+
+    response = await post_replay(
+        client, source_trace_id, idempotency_key=replay_trace_id
+    )
+
+    assert response.status_code == 409
+    assert "伪造回答" not in response.text
+    assert "replay_trace" not in response.text
+    assert openai_upstream.requests == []
+    assert reservation_state(application, replay_trace_id) is None
+
+
+@pytest.mark.asyncio
+async def test_replay_retry_returns_server_snapshot_after_client_mutates_replay_trace(
+    client, application, openai_upstream
+):
+    source_trace_id = "replay-tamper-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "先正常重放再篡改"}],
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    first = await post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+    assert first.status_code == 201
+    original = first.json()
+    assert original["replay_trace"]["status"] == "completed"
+
+    tampered_trace = deepcopy(original["replay_trace"])
+    tampered_trace["output"] = chat_output(content="篡改回答")
+    tampered_trace["status"] = "completed"
+    tampered_trace["metadata"]["replay"]["comparison"] = {
+        **tampered_trace["metadata"]["replay"]["comparison"],
+        "status": "same",
+        "content_equal": True,
+        "content_similarity": 1.0,
+        "content_diff": "",
+    }
+    tampered_span = deepcopy(original["replay_span"])
+    tampered_span["content"] = "篡改回答"
+    tampered_span["output"] = tampered_trace["output"]
+    mutated = await client.post(
+        "/api/traces/ingest",
+        json={"trace": tampered_trace, "spans": [tampered_span]},
+    )
+    assert mutated.status_code == 200
+
+    retry = await post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+
+    assert retry.status_code == 201
+    assert retry.json() == original
+    assert "篡改回答" not in retry.text
+    assert len(openai_upstream.requests) == 1
+    state = reservation_state(application, replay_trace_id)
+    assert state["status"] == "completed"
+    assert state["response_json"] == original
+
+
+@pytest.mark.asyncio
+async def test_replay_same_key_retry_after_source_deleted_returns_cached_snapshot(
+    client, application, openai_upstream
+):
+    source_trace_id = "replay-deleted-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "删除来源后重试"}],
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    first = await post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+    assert first.status_code == 201
+    original = first.json()
+
+    deleted = await client.delete(f"/api/traces/{source_trace_id}")
+    assert deleted.status_code == 204
+
+    retry = await post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+
+    assert retry.status_code == 201
+    assert retry.json() == original
+    assert len(openai_upstream.requests) == 1
+    assert reservation_state(application, replay_trace_id)["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_preexisting_trace_at_key_without_reservation(
+    client, application, openai_upstream
+):
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        "replay-preexisting-key-source",
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "占用幂等键"}],
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+    occupy = {
+        "trace": {
+            "id": replay_trace_id,
+            "name": "普通链路占用了幂等键",
+            "source": "custom-agent",
+            "status": "completed",
+            "output": {"answer": "preexisting-secret-answer"},
+        },
+        "spans": [],
+    }
+    response = await client.post("/api/traces/ingest", json=occupy)
+    assert response.status_code == 200
+
+    replay = await post_replay(
+        client, "replay-preexisting-key-source", idempotency_key=replay_trace_id
+    )
+
+    assert replay.status_code == 409
+    assert "preexisting-secret-answer" not in replay.text
+    assert openai_upstream.requests == []
+    assert reservation_state(application, replay_trace_id) is None
+
+
+@pytest.mark.asyncio
+async def test_replay_running_reservation_returns_409_without_upstream(
+    client, application, openai_upstream
+):
+    from app.models import ReplayReservation
+    from app.replay import request_fingerprint
+    from app.schemas import ReplayRequest
+
+    source_trace_id = "replay-direct-running-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "预留执行中"}],
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+    with application.state.session_factory() as session:
+        session.add(
+            ReplayReservation(
+                idempotency_key=replay_trace_id,
+                request_fingerprint=request_fingerprint(
+                    source_trace_id, "source-llm", ReplayRequest(confirm=True)
+                ),
+                source_trace_id=source_trace_id,
+                source_span_id="source-llm",
+                status="running",
+            )
+        )
+        session.commit()
+
+    response = await post_replay(
+        client, source_trace_id, idempotency_key=replay_trace_id
+    )
+
+    assert response.status_code == 409
+    assert openai_upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_replay_terminal_reservation_without_snapshot_returns_409(
+    client, application, openai_upstream
+):
+    from app.models import ReplayReservation
+    from app.replay import request_fingerprint
+    from app.schemas import ReplayRequest
+
+    source_trace_id = "replay-terminal-snapshot-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "终态无快照"}],
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+    with application.state.session_factory() as session:
+        session.add(
+            ReplayReservation(
+                idempotency_key=replay_trace_id,
+                request_fingerprint=request_fingerprint(
+                    source_trace_id, "source-llm", ReplayRequest(confirm=True)
+                ),
+                source_trace_id=source_trace_id,
+                source_span_id="source-llm",
+                status="completed",
+                response_json=None,
+            )
+        )
+        session.commit()
+
+    response = await post_replay(
+        client, source_trace_id, idempotency_key=replay_trace_id
+    )
+
+    assert response.status_code == 409
+    assert openai_upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_replay_persists_reservation_snapshots_for_completed_and_failed(
+    client, application, scenario_openai_upstream
+):
+    await configure_default_upstream(client, scenario_openai_upstream)
+    completed_source = "replay-reservation-completed-source"
+    failed_source = "replay-reservation-failed-source"
+    completed_key = str(uuid4())
+    failed_key = str(uuid4())
+    await seed_source(
+        client,
+        completed_source,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "正常完成"}],
+        },
+    )
+    await seed_source(
+        client,
+        failed_source,
+        span_id="failed-source-llm",
+        span_input={
+            "model": "server-error-model",
+            "messages": [{"role": "user", "content": "上游失败"}],
+        },
+    )
+
+    completed = await post_replay(
+        client, completed_source, idempotency_key=completed_key
+    )
+    failed = await post_replay(
+        client,
+        failed_source,
+        span_id="failed-source-llm",
+        idempotency_key=failed_key,
+    )
+
+    assert completed.status_code == 201
+    assert completed.json()["replay_trace"]["status"] == "completed"
+    completed_state = reservation_state(application, completed_key)
+    assert completed_state["status"] == "completed"
+    assert completed_state["response_json"] == completed.json()
+    assert completed_state["source_trace_id"] == completed_source
+    assert completed_state["source_span_id"] == "source-llm"
+
+    assert failed.status_code == 201
+    assert failed.json()["replay_trace"]["status"] == "failed"
+    assert failed.json()["comparison"]["status"] == "failed"
+    failed_state = reservation_state(application, failed_key)
+    assert failed_state["status"] == "failed"
+    assert failed_state["response_json"] == failed.json()
+    assert failed_state["error"] is not None
+    assert failed_state["error"]["status_code"] == 500
+
+
+@pytest.mark.asyncio
+async def test_replay_inband_sse_error_marks_failed_and_records_circuit_failure(
+    client, openai_upstream, scenario_openai_upstream
+):
+    await configure_default_upstream(
+        client,
+        openai_upstream,
+        gateway_failure_threshold=1,
+        gateway_cooldown_seconds=60,
+    )
+    first = await create_route(
+        client,
+        scenario_openai_upstream,
+        name="流内错误主路由",
+        match_model="demo-*",
+        target_model="inband-error-sse-model",
+        priority=1,
+    )
+    await create_route(
+        client,
+        openai_upstream,
+        name="流内错误不应重试的备用路由",
+        match_model="demo-*",
+        target_model="fallback-model",
+        priority=2,
+    )
+    await seed_source(
+        client,
+        "replay-inband-sse-error-source",
+        span_input={
+            "model": "demo-stream",
+            "stream": True,
+            "messages": [{"role": "user", "content": "流内错误"}],
+        },
+    )
+
+    response = await post_replay(client, "replay-inband-sse-error-source")
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["replay_trace"]["status"] == "failed"
+    assert body["replay_span"]["status"] == "failed"
+    assert body["comparison"]["status"] == "failed"
+    span_error = body["replay_span"]["error"]
+    assert span_error["type"] == "UpstreamSSEError"
+    assert span_error["message"] == "上游流内错误"
+    assert span_error["body"]["error"]["code"] == "bad_gateway_stream"
+    assert body["replay_trace"]["error"] == span_error
+    assert body["replay_span"]["metadata"]["upstream_status"] == 200
+    attempts = body["replay_trace"]["metadata"]["gateway"]["attempts"]
+    assert attempts[0]["outcome"] == "error"
+    assert attempts[0]["status_code"] == 200
+    assert attempts[0]["error_type"] == "UpstreamSSEError"
+    assert len(attempts) == 1
+    assert len(scenario_openai_upstream.requests) == 1
+    assert openai_upstream.requests == []
+
+    routes = await route_states(client)
+    assert routes[first["id"]]["circuit"]["status"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_replay_snapshot_commit_failure_never_returns_fake_success(
+    client, application, openai_upstream, monkeypatch
+):
+    source_trace_id = "replay-snapshot-commit-failure-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "快照提交失败"}],
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    def broken_snapshot(*args, **kwargs):
+        raise RuntimeError("forced snapshot commit failure")
+
+    monkeypatch.setattr("app.replay.store_reservation_snapshot", broken_snapshot)
+
+    with pytest.raises(RuntimeError, match="forced snapshot commit failure"):
+        await post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+
+    assert len(openai_upstream.requests) == 1
+    state = reservation_state(application, replay_trace_id)
+    assert state["status"] == "failed"
+    assert state["response_json"] is None
+
+    retry = await post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+    assert retry.status_code == 409
+    assert len(openai_upstream.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_running_replay_trace_rejects_ingest_and_delete(
+    client, application, controlled_openai_upstream
+):
+    source_trace_id = "replay-running-mutation-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "运行期间禁止篡改"}],
+        },
+    )
+    await configure_default_upstream(client, controlled_openai_upstream)
+    controlled_openai_upstream.release.clear()
+    replay_task = asyncio.create_task(
+        post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+    )
+    arrived = await asyncio.to_thread(controlled_openai_upstream.request_arrived.wait, 5)
+    assert arrived
+
+    forged = {
+        "trace": {
+            "id": replay_trace_id,
+            "parent_id": "forged-parent",
+            "name": "伪造重放链路",
+            "source": "forged-source",
+            "status": "completed",
+            "metadata": {"replay": {"kind": "forged"}},
+        },
+        "spans": [
+            {
+                "id": "forged-running-span",
+                "trace_id": replay_trace_id,
+                "sequence": -100,
+                "kind": "llm",
+                "name": "伪造 LLM",
+                "content": "FORGED-SPAN",
+                "status": "completed",
+            }
+        ],
+    }
+    ingested = await client.post("/api/traces/ingest", json=forged)
+    deleted = await client.delete(f"/api/traces/{replay_trace_id}")
+    controlled_openai_upstream.release.set()
+    replayed = await replay_task
+
+    assert ingested.status_code == 409
+    assert deleted.status_code == 409
+    assert replayed.status_code == 201
+    body = replayed.json()
+    assert body["replay_trace"]["parent_id"] == source_trace_id
+    assert body["replay_trace"]["source"] == "replay"
+    assert body["replay_trace"]["metadata"]["replay"]["source_trace_id"] == source_trace_id
+    assert body["replay_trace"]["metadata"]["replay"]["source_span_id"] == "source-llm"
+    assert body["replay_trace"]["span_count"] == 1
+    assert body["replay_span"]["content"] == "无工具重放回答"
+    assert "FORGED-SPAN" not in replayed.text
+    assert len(controlled_openai_upstream.requests) == 1
+
+    retry = await post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+    assert retry.status_code == 201
+    assert retry.json() == body
+    assert len(controlled_openai_upstream.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_running_replay_trace_rejects_openai_proxy_writes(
+    client, controlled_openai_upstream, openai_upstream
+):
+    source_trace_id = "replay-running-proxy-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "运行期间禁止代理追加"}],
+        },
+    )
+    await configure_default_upstream(client, controlled_openai_upstream)
+    controlled_openai_upstream.release.clear()
+    replay_task = asyncio.create_task(
+        post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+    )
+    arrived = await asyncio.to_thread(controlled_openai_upstream.request_arrived.wait, 5)
+    assert arrived
+
+    proxy_response = await client.post(
+        "/v1/chat/completions",
+        headers={
+            "X-AgentTrace-Id": replay_trace_id,
+            "X-Upstream-Base": openai_upstream.base_url,
+        },
+        json={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "不应到达上游"}],
+        },
+    )
+    controlled_openai_upstream.release.set()
+    replayed = await replay_task
+
+    assert proxy_response.status_code == 409
+    assert openai_upstream.requests == []
+    assert replayed.status_code == 201
+    assert replayed.json()["replay_trace"]["span_count"] == 1
+    assert replayed.json()["replay_span"]["content"] == "无工具重放回答"
+    assert len(controlled_openai_upstream.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_replay_rejects_acronym_camelcase_credential_key(client, openai_upstream):
+    source_trace_id = "replay-acronym-credential-source"
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [],
+            "APIToken": "persisted-secret",
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    response = await post_replay(client, source_trace_id)
+
+    assert response.status_code == 409
+    assert openai_upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_replay_allows_official_prompt_cache_key_parameter(client, openai_upstream):
+    source_trace_id = "replay-prompt-cache-key-source"
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [],
+            "prompt_cache_key": "public-cache-prefix",
+        },
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    response = await post_replay(client, source_trace_id)
+
+    assert response.status_code == 201
+    assert len(openai_upstream.requests) == 1
+    assert openai_upstream.requests[0]["payload"]["prompt_cache_key"] == "public-cache-prefix"
+
+
+@pytest.mark.asyncio
+async def test_replay_reservation_creation_and_ingest_are_atomic(
+    client, application, controlled_openai_upstream, monkeypatch
+):
+    import app.audit as audit_module
+
+    source_trace_id = "replay-ingest-race-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "预留与写入必须互斥"}],
+        },
+    )
+    await configure_default_upstream(client, controlled_openai_upstream)
+    original_guard = audit_module.ensure_trace_not_running_replay
+    guard_passed = threading.Event()
+    release_ingest = threading.Event()
+
+    def paused_guard(session, trace_id):
+        original_guard(session, trace_id)
+        if trace_id == replay_trace_id:
+            guard_passed.set()
+            if not release_ingest.wait(5):
+                raise RuntimeError("timed out waiting to release ingest")
+
+    monkeypatch.setattr(audit_module, "ensure_trace_not_running_replay", paused_guard)
+    forged = {
+        "trace": {
+            "id": replay_trace_id,
+            "name": "RACE-FORGED",
+            "source": "forged-source",
+            "status": "completed",
+        },
+        "spans": [
+            {
+                "id": "race-forged-span",
+                "trace_id": replay_trace_id,
+                "sequence": -100,
+                "kind": "llm",
+                "name": "竞态伪造 LLM",
+                "content": "RACE-FORGED-CONTENT",
+                "status": "completed",
+            }
+        ],
+    }
+    ingest_task = asyncio.create_task(client.post("/api/traces/ingest", json=forged))
+    checked = await asyncio.to_thread(guard_passed.wait, 5)
+    if not checked:
+        release_ingest.set()
+        await ingest_task
+    assert checked
+    replay_task = asyncio.create_task(
+        post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+    )
+    # With a real write lock, Replay cannot reach upstream until ingest commits.
+    upstream_before_ingest_commit = await asyncio.to_thread(
+        controlled_openai_upstream.request_arrived.wait, 0.5
+    )
+    release_ingest.set()
+    ingested = await ingest_task
+    replayed = await replay_task
+
+    assert upstream_before_ingest_commit is False
+    assert ingested.status_code == 200
+    assert replayed.status_code == 409
+    assert controlled_openai_upstream.requests == []
+    assert reservation_state(application, replay_trace_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["APITOKEN", "ACCESSTOKEN", "AUTHTOKEN", "SESSIONKEY"])
+async def test_replay_rejects_compact_uppercase_credential_keys(
+    client, openai_upstream, field
+):
+    source_trace_id = f"replay-compact-credential-{field.lower()}"
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={"model": "safe-model", "messages": [], field: "persisted-secret"},
+    )
+    await configure_default_upstream(client, openai_upstream)
+
+    response = await post_replay(client, source_trace_id)
+
+    assert response.status_code == 409
+    assert openai_upstream.requests == []
+
+
+@pytest.mark.asyncio
+async def test_running_replay_trace_rejects_mcp_before_upstream(
+    client, controlled_openai_upstream, openai_upstream
+):
+    source_trace_id = "replay-running-mcp-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "运行期间禁止 MCP 写入"}],
+        },
+    )
+    await configure_default_upstream(client, controlled_openai_upstream)
+    controlled_openai_upstream.release.clear()
+    replay_task = asyncio.create_task(
+        post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+    )
+    arrived = await asyncio.to_thread(controlled_openai_upstream.request_arrived.wait, 5)
+    assert arrived
+
+    mcp_response = await client.post(
+        "/mcp",
+        headers={
+            "X-AgentTrace-Id": replay_trace_id,
+            "X-MCP-Upstream": openai_upstream.base_url + "/chat/completions",
+        },
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    )
+    controlled_openai_upstream.release.set()
+    replayed = await replay_task
+
+    assert mcp_response.status_code == 409
+    assert openai_upstream.requests == []
+    assert replayed.status_code == 201
+    assert replayed.json()["replay_trace"]["span_count"] == 1
+    assert len(controlled_openai_upstream.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_running_replay_rejects_llm_check_and_reanalyze_writes(
+    client, application, controlled_openai_upstream, monkeypatch
+):
+    source_trace_id = "replay-running-analysis-source"
+    replay_trace_id = str(uuid4())
+    await seed_source(
+        client,
+        source_trace_id,
+        span_input={
+            "model": "safe-model",
+            "messages": [{"role": "user", "content": "运行期间禁止二次分析"}],
+        },
+    )
+    await configure_default_upstream(client, controlled_openai_upstream)
+    settings = application.state.settings
+    settings.enable_llm_check = True
+    settings.check_model_key = "synthetic-test-only"
+    settings.check_model_name = "synthetic-check-model"
+    llm_called = False
+
+    async def fake_llm_check(trace, settings):
+        nonlocal llm_called
+        llm_called = True
+        return []
+
+    monkeypatch.setattr("app.api.run_llm_check", fake_llm_check)
+    controlled_openai_upstream.release.clear()
+    replay_task = asyncio.create_task(
+        post_replay(client, source_trace_id, idempotency_key=replay_trace_id)
+    )
+    arrived = await asyncio.to_thread(controlled_openai_upstream.request_arrived.wait, 5)
+    assert arrived
+
+    reanalyzed = await client.post(f"/api/traces/{replay_trace_id}/reanalyze")
+    llm_checked = await client.post(f"/api/traces/{replay_trace_id}/llm-check")
+    controlled_openai_upstream.release.set()
+    replayed = await replay_task
+
+    assert reanalyzed.status_code == 409
+    assert llm_checked.status_code == 409
+    assert llm_called is False
+    assert replayed.status_code == 201
+    assert "llm_check" not in replayed.json()["replay_trace"]["metadata"]
+    assert len(controlled_openai_upstream.requests) == 1

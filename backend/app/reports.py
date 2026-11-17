@@ -129,9 +129,9 @@ def comment_lines(trace: Trace, *, markdown: bool = True) -> list[str]:
 def render_markdown(trace: Trace) -> str:
     severity = Counter(finding.severity for finding in trace.findings)
     lines = [
-        "# AgentTrace 审计报告",
+        "# TraceMend 审计报告",
         "",
-        f"> 生成时间：{generated_at()}　|　数据来源：本地 AgentTrace 自托管实例",
+        f"> 生成时间：{generated_at()}　|　数据来源：本地 TraceMend 自托管实例",
         "",
         "## 1. 链路概览",
         "",
@@ -213,19 +213,19 @@ def render_markdown(trace: Trace) -> str:
     )
     lines.extend(
         [
-            "- 本报告由中国本地部署的 AgentTrace 自动生成，原始 Trace、Span 与评论保留在本地数据库。",
+            "- 本报告由中国本地部署的 TraceMend 自动生成，原始 Trace、Span 与评论保留在本地数据库。",
             "- 一阶规则检测基于参数结构、工具状态、引用完整性和数值支撑等可解释线索，可能产生误报，需要人工复核。",
             "- 二阶 LLM 检测为可选增值能力，仅在维护者显式开启后运行；其结论同样属于线索，不等同于事实认定。",
             "- 报告中已对常见认证头、API Key 等敏感值做脱敏；仍建议在对外分享前按组织制度复核。",
             "- 本报告用于工程复盘、测试归档与合规留痕，不构成事实或法律结论。",
             "",
-            f"_AgentTrace · Trace `{markdown_code(trace.id)}` · {generated_at()}_",
+            f"_TraceMend · Trace `{markdown_code(trace.id)}` · {generated_at()}_",
         ]
     )
     return "\n".join(lines) + "\n"
 
 
-_FONT = "AgentTraceCN"
+_FONT = "TraceMendCN"
 _FONT_PATH = Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSansSC-VF.ttf"
 
 
@@ -244,7 +244,7 @@ def _pdf_styles():
     base = getSampleStyleSheet()
     return {
         "title": ParagraphStyle(
-            "AgentTraceCnTitle",
+            "TraceMendCnTitle",
             parent=base["Title"],
             fontName=font_name,
             fontSize=20,
@@ -252,7 +252,7 @@ def _pdf_styles():
             textColor=colors.HexColor("#0f172a"),
         ),
         "h2": ParagraphStyle(
-            "AgentTraceCnH2",
+            "TraceMendCnH2",
             parent=base["Heading2"],
             fontName=font_name,
             fontSize=13,
@@ -262,7 +262,7 @@ def _pdf_styles():
             textColor=colors.HexColor("#0f766e"),
         ),
         "body": ParagraphStyle(
-            "AgentTraceCnBody",
+            "TraceMendCnBody",
             parent=base["BodyText"],
             fontName=font_name,
             fontSize=9,
@@ -270,7 +270,7 @@ def _pdf_styles():
             alignment=TA_LEFT,
         ),
         "small": ParagraphStyle(
-            "AgentTraceCnSmall", parent=base["BodyText"], fontName=font_name, fontSize=7.5, leading=10.5
+            "TraceMendCnSmall", parent=base["BodyText"], fontName=font_name, fontSize=7.5, leading=10.5
         ),
     }
 
@@ -289,11 +289,11 @@ def render_pdf(trace: Trace) -> bytes:
         rightMargin=16 * mm,
         topMargin=15 * mm,
         bottomMargin=15 * mm,
-        title=f"AgentTrace 审计报告 - {trace.name}",
-        author="AgentTrace",
+        title=f"TraceMend 审计报告 - {trace.name}",
+        author="TraceMend",
     )
     story: list[Any] = [
-        Paragraph("AgentTrace 审计报告", styles["title"]),
+        Paragraph("TraceMend 审计报告", styles["title"]),
         Paragraph(f"生成时间：{generated_at()}　|　Trace：{escape(trace.id)}", styles["small"]),
         Spacer(1, 5 * mm),
         Paragraph("1. 链路概览", styles["h2"]),
@@ -395,7 +395,7 @@ def render_pdf(trace: Trace) -> bytes:
         story.append(pdf_paragraph(line.lstrip("- "), styles["small"], 1200))
     story.extend([PageBreak(), Paragraph("6. 证据与局限", styles["h2"])])
     for line in (
-        "本报告由中国本地部署的 AgentTrace 自动生成，原始 Trace、Span 与评论保留在本地数据库。",
+        "本报告由中国本地部署的 TraceMend 自动生成，原始 Trace、Span 与评论保留在本地数据库。",
         "规则检测结果可能产生误报，需要人工复核；二阶 LLM 检测为可选能力，其结论属于线索。",
         "报告中已对常见认证头、API Key 等敏感值做脱敏；对外分享前仍应按组织制度复核。",
         "本报告用于工程复盘、测试归档与合规留痕，不构成事实或法律结论。",

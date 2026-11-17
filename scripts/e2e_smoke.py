@@ -318,7 +318,7 @@ def run_checks(smoke: SmokeTest, timeout: float) -> None:
 
         health = smoke.api("GET", "/api/health")
         expect_status(health)
-        print(f"[2/7] AgentTrace 健康检查通过：{health.body.decode('utf-8', errors='replace')}")
+        print(f"[2/7] TraceMend 健康检查通过：{health.body.decode('utf-8', errors='replace')}")
 
         nonstream_id = smoke.new_id()
         nonstream = request(

@@ -3,7 +3,15 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote, urlsplit
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 
 class SpanIn(BaseModel):
@@ -57,6 +65,39 @@ class TraceIn(BaseModel):
 class IngestIn(BaseModel):
     trace: TraceIn
     spans: list[SpanIn] = Field(default_factory=list)
+
+
+class ReplayOverrides(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: StrictStr | None = Field(default=None, min_length=1, max_length=120)
+    temperature: float | None = Field(default=None, strict=True, ge=0, le=2)
+    top_p: float | None = Field(default=None, strict=True, ge=0, le=1)
+    seed: StrictInt | None = Field(default=None, ge=0)
+    max_tokens: StrictInt | None = Field(default=None, ge=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def explicit_nulls_rejected(cls, data):
+        if isinstance(data, dict):
+            for field in cls.model_fields:
+                if field in data and data[field] is None:
+                    raise ValueError(f"{field} 不能为 null")
+        return data
+
+
+class ReplayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: bool
+    overrides: ReplayOverrides = Field(default_factory=ReplayOverrides)
+
+    @field_validator("confirm", mode="before")
+    @classmethod
+    def confirmation_must_be_literal_true(cls, value):
+        if value is not True:
+            raise ValueError("confirm 必须为布尔值 true")
+        return value
 
 
 class CommentCreate(BaseModel):

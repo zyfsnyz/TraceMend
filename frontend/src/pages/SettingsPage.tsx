@@ -192,7 +192,7 @@ export function SettingsPage() {
           <div className="mt-auto flex justify-end border-t border-slate-100 pt-4"><button type="button" className="btn-secondary" onClick={() => void handleTest('check')} disabled={testing !== ''}><Bot size={14} />{testing === 'check' ? '正在测试' : '保存并测试连接'}</button></div>
         </div></section>
 
-        <section className="panel flex h-full flex-col"><SectionHeader icon={Wrench} title="MCP 工具连接" description="配置后，MCP 客户端只需连接 AgentTrace /mcp。" /><div className="flex flex-1 flex-col gap-4 p-5">
+        <section className="panel flex h-full flex-col"><SectionHeader icon={Wrench} title="MCP 工具连接" description="配置后，MCP 客户端只需连接 TraceMend /mcp。" /><div className="flex flex-1 flex-col gap-4 p-5">
           <Field label="默认 MCP 完整 URL" hint="包含服务路径，例如 http://127.0.0.1:9000/mcp"><input className="input w-full font-mono text-xs" value={form.default_mcp_upstream} onChange={(event) => update('default_mcp_upstream', event.target.value)} placeholder="http://127.0.0.1:9000/mcp" /></Field>
           <SecretField label="MCP API Key（可选）" configured={form.default_mcp_key_configured} value={secrets.default_mcp_key} onChange={(value) => updateSecret('default_mcp_key', value)} onClear={() => void clearSecret('default_mcp_key')} />
           <div className="mt-auto flex justify-end border-t border-slate-100 pt-4"><button type="button" className="btn-secondary" onClick={() => void handleTest('mcp')} disabled={testing !== ''}><Network size={14} />{testing === 'mcp' ? '正在初始化' : '保存并测试 initialize'}</button></div>

@@ -1,4 +1,4 @@
-# AgentTrace Implementation Plan
+# TraceMend Implementation Plan
 
 > **For Hermes:** Use subagent-driven-development and test-driven-development. Execute and verify every task; do not substitute mock claims for real execution.
 

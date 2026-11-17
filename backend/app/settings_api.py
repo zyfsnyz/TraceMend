@@ -66,7 +66,7 @@ async def test_mcp_connection(url: str, key: str | None):
                     "params": {
                         "protocolVersion": "2025-03-26",
                         "capabilities": {},
-                        "clientInfo": {"name": "AgentTrace", "version": "0.2.0"},
+                        "clientInfo": {"name": "TraceMend", "version": "0.2.0"},
                     },
                 },
             )

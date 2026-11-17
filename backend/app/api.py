@@ -9,7 +9,8 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import selectinload
 
-from .audit import ingest, load_detail
+from .async_db import run_db
+from .audit import ensure_trace_not_running_replay, ingest, load_detail
 from .llm_check import LLMCheckError, run_llm_check
 from .models import Comment, Finding, GatewayRoute, Span, Trace
 from .reports import render_markdown, render_pdf
@@ -26,7 +27,7 @@ def report_content_disposition(trace_id: str, extension: str) -> str:
     digest = hashlib.sha256(trace_id.encode("utf-8")).hexdigest()[:8]
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", trace_id).strip("-")[:48]
     stem = f"{slug}-{digest}" if slug else digest
-    return f'attachment; filename="agenttrace-{stem}.{extension}"'
+    return f'attachment; filename="tracemend-{stem}.{extension}"'
 
 
 @router.post("/traces/ingest")
@@ -119,6 +120,7 @@ def get_trace(trace_id: str, request: Request):
 @router.post("/traces/{trace_id}/reanalyze")
 def reanalyze_trace(trace_id: str, request: Request):
     with request.app.state.session_factory() as session:
+        ensure_trace_not_running_replay(session, trace_id)
         trace = load_detail(session, trace_id)
         if trace is None:
             raise HTTPException(status_code=404, detail="审计链路不存在")
@@ -219,33 +221,47 @@ def export_pdf_report(trace_id: str, request: Request):
     )
 
 
-@router.post("/traces/{trace_id}/llm-check")
-async def llm_check_trace(trace_id: str, request: Request):
-    settings = request.app.state.settings
-    if not settings.enable_llm_check:
-        raise HTTPException(status_code=409, detail="二阶 LLM 检测未启用")
-    if not settings.check_model_key:
-        raise HTTPException(status_code=409, detail="二阶 LLM 检测未配置模型密钥")
-    with request.app.state.session_factory() as session:
+def load_llm_check_input(session_factory, trace_id: str):
+    with session_factory() as session:
+        ensure_trace_not_running_replay(session, trace_id)
         trace = load_detail(session, trace_id)
         if trace is None:
             raise HTTPException(status_code=404, detail="审计链路不存在")
-        try:
-            findings = await run_llm_check(trace, settings)
-        except LLMCheckError as exc:
-            trace.metadata_json = {
-                **(trace.metadata_json or {}),
-                "llm_check": {
-                    "status": "failed",
-                    "model": settings.check_model_name,
-                    "checked_at": datetime.now(UTC).isoformat(),
-                    "error": str(exc),
-                },
-            }
-            session.commit()
-            raise HTTPException(
-                status_code=502, detail="检测模型调用失败，请检查模型地址、密钥和网络"
-            ) from exc
+        # Release SQLite's writer lock before the external model call. The
+        # detached evidence is fully loaded; write-back checks again.
+        session.commit()
+        session.expunge_all()
+        return trace
+
+
+def record_llm_check_failure(
+    session_factory, trace_id: str, model_name: str, error: str
+) -> None:
+    with session_factory() as session:
+        ensure_trace_not_running_replay(session, trace_id)
+        trace = session.get(Trace, trace_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail="审计链路不存在")
+        trace.metadata_json = {
+            **(trace.metadata_json or {}),
+            "llm_check": {
+                "status": "failed",
+                "model": model_name,
+                "checked_at": datetime.now(UTC).isoformat(),
+                "error": error,
+            },
+        }
+        session.commit()
+
+
+def store_llm_check_results(
+    session_factory, trace_id: str, model_name: str, findings: list[dict]
+) -> dict:
+    with session_factory() as session:
+        ensure_trace_not_running_replay(session, trace_id)
+        trace = load_detail(session, trace_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail="审计链路不存在")
         for finding in list(trace.findings):
             if finding.source == "llm":
                 session.delete(finding)
@@ -256,7 +272,7 @@ async def llm_check_trace(trace_id: str, request: Request):
             **(trace.metadata_json or {}),
             "llm_check": {
                 "status": "completed",
-                "model": settings.check_model_name,
+                "model": model_name,
                 "checked_at": datetime.now(UTC).isoformat(),
                 "findings": len(findings),
             },
@@ -267,6 +283,37 @@ async def llm_check_trace(trace_id: str, request: Request):
             "finding_count": len(trace.findings),
             "llm_finding_count": len(findings),
         }
+
+
+@router.post("/traces/{trace_id}/llm-check")
+async def llm_check_trace(trace_id: str, request: Request):
+    settings = request.app.state.settings
+    if not settings.enable_llm_check:
+        raise HTTPException(status_code=409, detail="二阶 LLM 检测未启用")
+    if not settings.check_model_key:
+        raise HTTPException(status_code=409, detail="二阶 LLM 检测未配置模型密钥")
+    session_factory = request.app.state.session_factory
+    trace = await run_db(load_llm_check_input, session_factory, trace_id)
+    try:
+        findings = await run_llm_check(trace, settings)
+    except LLMCheckError as exc:
+        await run_db(
+            record_llm_check_failure,
+            session_factory,
+            trace_id,
+            settings.check_model_name,
+            str(exc),
+        )
+        raise HTTPException(
+            status_code=502, detail="检测模型调用失败，请检查模型地址、密钥和网络"
+        ) from exc
+    return await run_db(
+        store_llm_check_results,
+        session_factory,
+        trace_id,
+        settings.check_model_name,
+        findings,
+    )
 
 
 @router.get("/stats")
@@ -316,6 +363,7 @@ def get_stats(request: Request, days: int = Query(default=30, ge=1, le=3650)):
 @router.delete("/traces/{trace_id}", status_code=204)
 def delete_trace(trace_id: str, request: Request):
     with request.app.state.session_factory() as session:
+        ensure_trace_not_running_replay(session, trace_id)
         trace = session.get(Trace, trace_id)
         if trace is None:
             raise HTTPException(status_code=404, detail="审计链路不存在")

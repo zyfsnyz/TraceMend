@@ -36,6 +36,11 @@ def controlled_sse_upstream():
                 return
             if model == "interrupted-model":
                 raise RuntimeError("controlled upstream interruption")
+            if model == "inband-error-model":
+                error = {"error": {"message": "流内错误", "code": "stream_failed"}}
+                yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                return
             await asyncio.to_thread(release.wait, 5)
             yield b"data: [DONE]\n\n"
 
@@ -162,6 +167,39 @@ async def test_incomplete_or_interrupted_sse_records_failure(
     attempts = trace["metadata"]["gateway"]["attempts"]
     assert attempts[-1]["outcome"] == "error"
     assert attempts[-1]["status_code"] == 200
+
+
+@pytest.mark.asyncio
+async def test_inband_sse_error_event_marks_failure_and_opens_circuit(
+    client, application, controlled_sse_upstream
+):
+    await client.put(
+        "/api/settings",
+        json={
+            "default_upstream_base": controlled_sse_upstream.base_url,
+            "gateway_failure_threshold": 1,
+            "gateway_cooldown_seconds": 60,
+        },
+    )
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "inband-error-model", "stream": True, "messages": []},
+        headers={"X-AgentTrace-Id": "sse-inband-error"},
+    )
+
+    assert response.status_code == 200
+    assert response.text.endswith("data: [DONE]\n\n")
+    assert application.state.circuits.snapshot("default")["status"] == "open"
+    detail = await client.get("/api/traces/sse-inband-error")
+    trace = detail.json()["trace"]
+    assert trace["status"] == "failed"
+    assert trace["error"]["type"] == "UpstreamSSEError"
+    assert trace["error"]["message"] == "流内错误"
+    assert trace["error"]["body"]["error"]["code"] == "stream_failed"
+    attempts = trace["metadata"]["gateway"]["attempts"]
+    assert attempts[-1]["outcome"] == "error"
+    assert attempts[-1]["status_code"] == 200
+    assert attempts[-1]["error_type"] == "UpstreamSSEError"
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,62 @@ def test_settings_reject_non_ascii_admin_key():
         Settings(admin_key="测试密钥")
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "api_token",
+        "apiToken",
+        "API-TOKEN",
+        "accessKeyId",
+        "access_key_id",
+        "authKey",
+        "sessionKey",
+        "session_key",
+        "x-api-token",
+        "X-Api-Token",
+        "user_token",
+        "max_output_token",
+        "signing_key",
+        "signing_key_id",
+        "oauth_auth",
+        "client_auth",
+    ],
+)
+def test_replay_credential_key_filter_covers_remaining_bypasses(key):
+    from app.replay import _credential_like_key
+
+    assert _credential_like_key(key) is True
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "model",
+        "messages",
+        "max_tokens",
+        "max_completion_tokens",
+        "top_p",
+        "temperature",
+        "stop",
+        "stream",
+        "stream_options",
+        "tools",
+        "tool_choice",
+        "response_format",
+        "presence_penalty",
+        "frequency_penalty",
+        "logprobs",
+        "top_logprobs",
+        "seed",
+        "user",
+    ],
+)
+def test_replay_credential_key_filter_keeps_legitimate_parameters(key):
+    from app.replay import _credential_like_key
+
+    assert _credential_like_key(key) is False
+
+
 @pytest.mark.asyncio
 async def test_non_ascii_admin_header_is_rejected_without_server_error(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_URL", f"sqlite:///{tmp_path / 'header.db'}")

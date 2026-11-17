@@ -73,7 +73,13 @@ export function ReplayStudio({ traceId, span }: ReplayStudioProps) {
 
   const updateField = (field: OverrideField, value: string) => {
     setFields((current) => ({ ...current, [field]: value }));
+    if (!pending && idempotencyKey) {
+      // A changed request body must not reuse the previous request's key.
+      setIdempotencyKey(null);
+    }
   };
+
+  const locked = pending || result !== null;
 
   const buildOverrides = (): ReplayOverrides => {
     const overrides: ReplayOverrides = {};
@@ -89,7 +95,7 @@ export function ReplayStudio({ traceId, span }: ReplayStudioProps) {
 
   const submitReplay = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!confirmed || pendingRef.current) return;
+    if (!confirmed || pendingRef.current || result) return;
     const generation = generationRef.current;
     const requestToken = ++requestTokenRef.current;
     const requestKey = idempotencyKey ?? crypto.randomUUID();
@@ -134,7 +140,7 @@ export function ReplayStudio({ traceId, span }: ReplayStudioProps) {
       <div className="panel-header">
         <div>
           <h2 className="panel-title">Replay Studio · 真实重放</h2>
-          <p className="mt-1 text-[11px] text-slate-400">当前 Span：{span.name}</p>
+          <p className="mt-1 text-[11px] text-slate-400">当前 Span：{stringifySafe(span.name)}</p>
         </div>
         <span className="badge border-amber-200 bg-amber-50 text-amber-700">可能付费</span>
       </div>
@@ -150,39 +156,39 @@ export function ReplayStudio({ traceId, span }: ReplayStudioProps) {
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
             <div>
               <label className="label" htmlFor="replay-model">model</label>
-              <input id="replay-model" className="input w-full" value={fields.model} onChange={(event) => updateField('model', event.target.value)} placeholder="沿用原始模型" autoComplete="off" />
+              <input id="replay-model" className="input w-full" maxLength={120} value={fields.model} onChange={(event) => updateField('model', event.target.value)} placeholder="沿用原始模型" autoComplete="off" disabled={locked} />
             </div>
             <div>
               <label className="label" htmlFor="replay-temperature">temperature</label>
-              <input id="replay-temperature" className="input w-full" type="number" step="any" value={fields.temperature} onChange={(event) => updateField('temperature', event.target.value)} placeholder="沿用原值" />
+              <input id="replay-temperature" className="input w-full" type="number" step="any" min="0" max="2" value={fields.temperature} onChange={(event) => updateField('temperature', event.target.value)} placeholder="沿用原值" disabled={locked} />
             </div>
             <div>
               <label className="label" htmlFor="replay-top-p">top_p</label>
-              <input id="replay-top-p" className="input w-full" type="number" step="any" value={fields.top_p} onChange={(event) => updateField('top_p', event.target.value)} placeholder="沿用原值" />
+              <input id="replay-top-p" className="input w-full" type="number" step="any" min="0" max="1" value={fields.top_p} onChange={(event) => updateField('top_p', event.target.value)} placeholder="沿用原值" disabled={locked} />
             </div>
             <div>
               <label className="label" htmlFor="replay-seed">seed</label>
-              <input id="replay-seed" className="input w-full" type="number" step="1" value={fields.seed} onChange={(event) => updateField('seed', event.target.value)} placeholder="沿用原值" />
+              <input id="replay-seed" className="input w-full" type="number" step="1" min="0" value={fields.seed} onChange={(event) => updateField('seed', event.target.value)} placeholder="沿用原值" disabled={locked} />
             </div>
             <div>
               <label className="label" htmlFor="replay-max-tokens">max_tokens</label>
-              <input id="replay-max-tokens" className="input w-full" type="number" step="1" min="1" value={fields.max_tokens} onChange={(event) => updateField('max_tokens', event.target.value)} placeholder="沿用原值" />
+              <input id="replay-max-tokens" className="input w-full" type="number" step="1" min="1" value={fields.max_tokens} onChange={(event) => updateField('max_tokens', event.target.value)} placeholder="沿用原值" disabled={locked} />
             </div>
           </div>
           <p className="text-[11px] leading-5 text-slate-400">留空字段不会放入 overrides，后端沿用可安全重建的原始请求参数。</p>
 
           <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-800">
-            <input className="mt-1 h-4 w-4 shrink-0 accent-amber-600" type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
+            <input className="mt-1 h-4 w-4 shrink-0 accent-amber-600" type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} disabled={locked} />
             <span>我确认本次操作是单次 LLM 真实重放，会请求上游模型并可能产生费用。</span>
           </label>
 
           <div className="flex flex-wrap items-center gap-3">
-            <button className="btn-primary" type="submit" disabled={!confirmed || pending}>
+            <button className="btn-primary" type="submit" disabled={!confirmed || pending || Boolean(result)}>
               {pending && <LoaderCircle size={14} className="animate-spin" />}
               {pending ? '重放中…' : '开始真实重放'}
             </button>
             {pending && <span className="text-xs text-slate-500" role="status">正在请求上游模型，请勿重复提交。</span>}
-            {result && <button className="btn-secondary" type="button" onClick={startNewExperiment}><RotateCcw size={14} />新实验</button>}
+            {(result || error) && <button className="btn-secondary" type="button" onClick={startNewExperiment}><RotateCcw size={14} />新实验</button>}
           </div>
         </form>
 
@@ -191,12 +197,25 @@ export function ReplayStudio({ traceId, span }: ReplayStudioProps) {
         {result && (
           <div className="space-y-4 border-t border-slate-100 pt-5">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="badge border-slate-200 bg-slate-50 text-slate-600">对比状态：{result.comparison.status === 'equal' ? '一致' : '不同'}</span>
-              <span className={`badge ${result.comparison.content_equal ? 'border-teal-200 bg-teal-50 text-teal-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>内容{result.comparison.content_equal ? '一致' : '不同'}</span>
-              <span className={`badge ${result.comparison.reasoning_equal ? 'border-teal-200 bg-teal-50 text-teal-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>推理{result.comparison.reasoning_equal ? '一致' : '不同'}</span>
-              <span className={`badge ${result.comparison.tool_calls_equal ? 'border-teal-200 bg-teal-50 text-teal-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>工具调用{result.comparison.tool_calls_equal ? '一致' : '不同'}</span>
-              <span className="text-xs font-semibold text-slate-600">内容相似度：{Math.round(result.comparison.content_similarity * 100)}%</span>
+              <span className="badge border-slate-200 bg-slate-50 text-slate-600">
+                对比状态：{result.comparison.status === 'same' ? '一致' : result.comparison.status === 'failed' ? '重放失败' : '不同'}
+              </span>
+              {result.comparison.status !== 'failed' && (
+                <>
+                  <span className={`badge ${result.comparison.content_equal ? 'border-teal-200 bg-teal-50 text-teal-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>内容{result.comparison.content_equal ? '一致' : '不同'}</span>
+                  <span className={`badge ${result.comparison.reasoning_equal ? 'border-teal-200 bg-teal-50 text-teal-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>推理{result.comparison.reasoning_equal ? '一致' : '不同'}</span>
+                  <span className={`badge ${result.comparison.tool_calls_equal ? 'border-teal-200 bg-teal-50 text-teal-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>工具调用{result.comparison.tool_calls_equal ? '一致' : '不同'}</span>
+                  <span className="text-xs font-semibold text-slate-600">内容相似度：{Math.round(result.comparison.content_similarity * 100)}%</span>
+                </>
+              )}
             </div>
+
+            {result.comparison.status === 'failed' && (
+              <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs leading-5 text-red-700" role="status">
+                <p className="mb-1 font-semibold">上游调用失败，已保存审计记录</p>
+                <pre className="whitespace-pre-wrap break-all font-mono">{stringifySafe(result.replay_span.error ?? result.replay_span.output)}</pre>
+              </div>
+            )}
 
             <div className="grid gap-4 lg:grid-cols-2">
               <section className="min-w-0">
@@ -213,10 +232,12 @@ export function ReplayStudio({ traceId, span }: ReplayStudioProps) {
               </section>
             </div>
 
-            <section>
-              <h3 className="mb-2 text-xs font-semibold text-slate-700">内容 Diff（已脱敏）</h3>
-              <pre className="code-block max-w-none">{stringifySafe(result.comparison.content_diff)}</pre>
-            </section>
+            {result.comparison.status === 'different' && (
+              <section>
+                <h3 className="mb-2 text-xs font-semibold text-slate-700">内容 Diff（已脱敏）</h3>
+                <pre className="code-block max-w-none">{stringifySafe(result.comparison.content_diff)}</pre>
+              </section>
+            )}
             <p className="rounded-lg border border-blue-200 bg-blue-50 px-3.5 py-2.5 text-xs leading-5 text-blue-700">{stringifySafe(result.comparison.attribution_note)}</p>
             <Link className="inline-flex items-center gap-1.5 text-xs font-medium text-teal-700 hover:text-teal-800" to={`/traces/${encodeURIComponent(result.replay_trace.id)}`}>
               查看重放 Trace<ExternalLink size={13} />

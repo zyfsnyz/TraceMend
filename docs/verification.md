@@ -1,6 +1,25 @@
-# AgentTrace 验收记录
+# TraceMend 验收记录
 
-本文件记录仓库当前的本地实测结果，便于区分“已运行验证”和“仅完成实现”。
+本文件记录仓库当前的本地实测结果，便于区分“已运行验证”和“仅完成实现”。历史日期段落保留当时快照；当前门禁以下方“当前自动化门禁”为准。
+
+## 当前自动化门禁（2026-11-17）
+
+本轮在 Windows 11 本机重新执行，覆盖 Replay Studio 后端接口、前端回放交互与接入指南变更：
+
+| 范围 | 命令 | 结果 |
+|---|---|---|
+| 后端单元/接口测试 | `D:/python/python.exe -m pytest -q` | **354 项通过** |
+| 后端静态检查 | `D:/python/python.exe -m ruff check .` | `All checks passed!` |
+| 前端单元/交互测试 | `npm run test -- --run` | **20 个测试文件、84 项测试通过** |
+| 前端 ESLint | `npm run lint` | 通过 |
+| 前端生产构建 | `npm run build` | 通过，1630 个模块完成转换 |
+
+说明：
+
+- 后端 354 项包含 Replay API 的幂等、状态码、预算/熔断、失败审计与 SSE 归一化等回归测试。
+- 最终安全复核新增 RED → GREEN 回归：running 重放 Trace 的同 ID Ingest、DELETE、OpenAI/MCP 代理写入、reanalyze 与 llm-check 均返回 409；真实 paused-guard 竞态证明 `BEGIN IMMEDIATE` 让 Ingest 与预留创建只能有一个赢家。新增 6 项外部写锁心跳测试，覆盖 OpenAI、MCP、llm-check、reanalyze、DELETE 和 Replay reservation；`run_db()` 将 async 路由中的同步数据库锁等待放入工作线程，慢写者不再冻结事件循环，成功/失败快照语义保持不变。`APIToken` 与 `APITOKEN/ACCESSTOKEN/AUTHTOKEN/SESSIONKEY` 均被识别为凭据；官方非凭据参数 `prompt_cache_key` 可正常发往当前上游。终态后同键重试仍返回服务器保存的原始快照。
+- `npm run build` 实际执行 `tsc -b && vite build`，因此同时覆盖 TypeScript 构建检查。
+- 浏览器端到端验收已执行：真实 Chromium 中打开链路详情，通过时间线选中 LLM Span，修改 `temperature=0.8` 并确认付费后完成单 Span 重放；页面显示“对比状态：不同”、原始/重放输出与脱敏 Diff，结果态锁定参数和提交，只能通过“新实验”恢复。审计 API 确认仅生成 1 个 LLM Span、无工具执行、`parent_id` 正确、18 Token 计入预算。上游使用本地确定性 OpenAI-compatible mock，不调用付费外部模型；幂等伪造/篡改与 SSE 内联错误由自动化测试覆盖。
 
 ## 2026-11-11 Windows 11 本机验收
 
@@ -60,8 +79,8 @@ python scripts/e2e_smoke.py --cleanup
 
 1. 克隆现有凭据配置。
 2. 将克隆 profile 的 OpenAI 兼容 `base_url` 指向 `http://127.0.0.1:8000/v1`。
-3. 通过 AgentTrace 代理发出一次真实的 `hermes chat` 请求。
-4. 请求成功，AgentTrace 中生成一条 `completed` 的 Trace：3 个 Span、16,145 tokens；包含 system、user 和模型响应三条记录。
+3. 通过 TraceMend 代理发出一次真实的 `hermes chat` 请求。
+4. 请求成功，TraceMend 中生成一条 `completed` 的 Trace：3 个 Span、16,145 tokens；包含 system、user 和模型响应三条记录。
 5. 同一轮集成测试也抓到了上游额度耗尽导致的 429 失败重试链路，证明失败请求会被如实记录。
 
 ### 二阶 LLM 真实模型验收（2026-11-12）
@@ -97,3 +116,4 @@ python scripts/e2e_smoke.py --cleanup
 ### 未执行项
 
 - 本机没有安装 Docker，未实际执行容器构建和 `docker compose up`。已验证 Compose YAML 可解析、服务端口映射为 `127.0.0.1`，但容器运行时仍需在安装 Docker 的环境复验。
+- Replay Studio 的浏览器端到端操作在该历史节点尚未执行；随后已使用本地确定性 mock 完成 ReplayBar 零 Token 播放、付费确认、单步重放、输出对比与结果态锁定，见上方“当前自动化门禁”。

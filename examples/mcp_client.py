@@ -1,4 +1,4 @@
-"""通过 AgentTrace 转发一次 MCP tools/call；仅需 Python 标准库。"""
+"""通过 TraceMend 转发一次 MCP tools/call；仅需 Python 标准库。"""
 
 import json
 import os

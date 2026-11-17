@@ -147,7 +147,7 @@ describe('评论、LLM 检测与报告 API 契约', () => {
 
     await expect(downloadReport('trace-1', 'md')).resolves.toBeUndefined();
 
-    expect(anchor?.download).toBe('AgentTrace-trace-1-report.md');
+    expect(anchor?.download).toBe('TraceMend-trace-1-report.md');
   });
 });
 

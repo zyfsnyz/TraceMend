@@ -140,3 +140,26 @@ class GatewayRoute(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
+
+
+class ReplayReservation(Base):
+    """Server-owned idempotency record for real LLM span replays.
+
+    Only the replay endpoint may create or update this table. Trace metadata is
+    client-writable through ``POST /api/traces/ingest`` and can therefore never
+    prove that a replay happened or which response it returned.
+    """
+
+    __tablename__ = "replay_reservations"
+
+    idempotency_key: Mapped[str] = mapped_column(String, primary_key=True)
+    request_fingerprint: Mapped[str] = mapped_column(String)
+    source_trace_id: Mapped[str] = mapped_column(String, index=True)
+    source_span_id: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="running", index=True)
+    response_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[Any] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )

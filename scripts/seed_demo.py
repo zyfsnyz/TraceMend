@@ -255,7 +255,7 @@ def main() -> int:
             f"  trace_id={result['trace_id']}\n"
             f"  finding_count={result['finding_count']}"
         )
-    print("演示数据已写入，可在 AgentTrace 界面按 demo 标签查看。")
+    print("演示数据已写入，可在 TraceMend 界面按 demo 标签查看。")
     return 0
 
 

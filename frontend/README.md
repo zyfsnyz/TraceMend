@@ -1,4 +1,4 @@
-# AgentTrace Frontend
+# TraceMend Frontend
 
 中文 Agent 审计溯源工作台。React 18、TypeScript、Vite、Tailwind CSS、React Router 与 `@xyflow/react`。
 

@@ -1,5 +1,6 @@
 import json
 from contextlib import suppress
+from copy import deepcopy
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -8,7 +9,13 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .audit import make_span
+from .async_db import run_db
+from .audit import (
+    begin_write_transaction,
+    ensure_trace_id_not_running_replay,
+    ensure_trace_not_running_replay,
+    make_span,
+)
 from .gateway import gateway_metadata, load_candidates
 from .models import Trace
 from .rules import run_rules
@@ -73,6 +80,8 @@ def persist_openai_trace(
     ended_at: datetime,
     error=None,
     gateway: dict | None = None,
+    replay: dict | None = None,
+    upstream_status: int | None = None,
 ) -> None:
     invocation_id = uuid4().hex
     span_prefix = f"{trace_id}-{invocation_id}"
@@ -89,7 +98,7 @@ def persist_openai_trace(
     spans = []
     sequence = 0
     messages = payload.get("messages", [])
-    if not isinstance(messages, list):
+    if not isinstance(messages, list) or replay is not None:
         messages = []
     for item in messages:
         if not isinstance(item, dict):
@@ -117,10 +126,12 @@ def persist_openai_trace(
             id=llm_id,
             sequence=sequence,
             kind="llm",
-            name="模型响应",
+            name="重放模型响应" if replay is not None else "模型响应",
             status=status,
             started_at=started_at,
             ended_at=ended_at,
+            input=payload,
+            output=output,
             content=message.get("content"),
             reasoning=message.get("reasoning_content") or message.get("reasoning"),
             prompt_tokens=usage.get("prompt_tokens", 0),
@@ -130,12 +141,19 @@ def persist_openai_trace(
             metadata={
                 "invocation_id": invocation_id,
                 "upstream_status": (
-                    200
+                    upstream_status
+                    if upstream_status is not None
+                    else 200
                     if status == "completed"
                     else (error or {}).get("status_code")
                     if isinstance(error, dict)
                     else None
-                )
+                ),
+                **(
+                    {"requested_model": gateway.get("requested_model")}
+                    if gateway is not None
+                    else {}
+                ),
             },
         )
     )
@@ -149,7 +167,7 @@ def persist_openai_trace(
             function = tool["function"]
             schemas[function.get("name")] = function.get("parameters", {})
     tool_calls = message.get("tool_calls", [])
-    if not isinstance(tool_calls, list):
+    if not isinstance(tool_calls, list) or replay is not None:
         tool_calls = []
     for call in tool_calls:
         if not isinstance(call, dict) or not isinstance(call.get("function"), dict):
@@ -170,20 +188,31 @@ def persist_openai_trace(
         )
         sequence += 1
     with session_factory() as session:
+        if replay is None:
+            ensure_trace_not_running_replay(session, trace_id)
+        else:
+            begin_write_transaction(session)
         trace = session.get(Trace, trace_id)
         if trace is None:
             trace = Trace(
                 id=trace_id,
-                name="OpenAI 对话代理",
-                source="openai-proxy",
+                parent_id=(replay or {}).get("parent_id"),
+                name=(replay or {}).get("name", "OpenAI 对话代理"),
+                source=(replay or {}).get("source", "openai-proxy"),
                 status="completed",
                 started_at=started_at,
+                tags=deepcopy((replay or {}).get("tags", [])),
+                metadata_json=deepcopy((replay or {}).get("metadata", {})),
             )
             session.add(trace)
             session.flush()
 
-        previous_failed = trace.status in {"failed", "error"} or any(
-            span.status in {"failed", "error"} or span.error is not None for span in trace.spans
+        previous_failed = replay is None and (
+            trace.status in {"failed", "error"}
+            or any(
+                span.status in {"failed", "error"} or span.error is not None
+                for span in trace.spans
+            )
         )
         next_sequence = max((span.sequence for span in trace.spans), default=-1) + 1
         for data in sorted(spans, key=lambda item: item.sequence):
@@ -191,8 +220,9 @@ def persist_openai_trace(
             span.sequence += next_sequence
             trace.spans.append(span)
 
-        trace.name = "OpenAI 对话代理"
-        trace.source = "openai-proxy"
+        if replay is None:
+            trace.name = "OpenAI 对话代理"
+            trace.source = "openai-proxy"
         trace.status = "failed" if previous_failed or status == "failed" else status
         trace.model = payload.get("model")
         trace.input = payload
@@ -203,6 +233,17 @@ def persist_openai_trace(
         )
         trace.total_tokens = (trace.total_tokens or 0) + usage.get("total_tokens", 0)
         trace.error = error if error is not None else trace.error
+        if replay is not None and replay.get("metadata"):
+            metadata_updates = deepcopy(replay["metadata"])
+            existing_replay = (trace.metadata_json or {}).get("replay", {})
+            if isinstance(existing_replay, dict) and isinstance(
+                metadata_updates.get("replay"), dict
+            ):
+                metadata_updates["replay"] = {
+                    **existing_replay,
+                    **metadata_updates["replay"],
+                }
+            trace.metadata_json = {**(trace.metadata_json or {}), **metadata_updates}
         if gateway is not None:
             previous_gateway = (trace.metadata_json or {}).get("gateway", {})
             previous_cost = (
@@ -243,6 +284,7 @@ class SSEAccumulator:
         self.tool_calls: dict[int, dict] = {}
         self.usage = {}
         self.done = False
+        self.error = None
 
     def feed(self, chunk: bytes) -> None:
         self.buffer += chunk
@@ -276,6 +318,10 @@ class SSEAccumulator:
             return
         if not isinstance(event, dict):
             return
+        if event.get("error") is not None and self.error is None:
+            # HTTP 200 can still carry an in-band failure event; it is audit
+            # evidence, never a successful completion.
+            self.error = event["error"]
         if isinstance(event.get("usage"), dict):
             self.usage = event["usage"]
         choices = event.get("choices", [])
@@ -338,6 +384,17 @@ class SSEAccumulator:
         }
 
 
+def sse_error_evidence(payload: object) -> dict:
+    """Normalize an in-band SSE ``error`` event into audit error evidence."""
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(message, str) or not message:
+        try:
+            message = json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError):
+            message = str(payload)
+    return {"type": "UpstreamSSEError", "message": message, "body": {"error": payload}}
+
+
 async def relay_sse(
     upstream: httpx.Response,
     client: httpx.AsyncClient,
@@ -371,6 +428,8 @@ async def relay_sse(
                 try:
                     ended_at = datetime.now(UTC)
                     output = accumulator.output(payload)
+                    if error is None and accumulator.error is not None:
+                        error = sse_error_evidence(accumulator.error)
                     if (
                         candidate is not None
                         and not candidate.explicit
@@ -408,7 +467,8 @@ async def relay_sse(
                         if candidate is not None and not candidate.explicit and settings is not None
                         else None
                     )
-                    persist_openai_trace(
+                    await run_db(
+                        persist_openai_trace,
                         session_factory,
                         trace_id,
                         payload,
@@ -425,7 +485,7 @@ async def relay_sse(
                 await client.aclose()
 
 
-def network_failure_response(
+async def network_failure_response(
     session_factory,
     trace_id: str,
     payload: dict,
@@ -434,7 +494,8 @@ def network_failure_response(
     gateway: dict | None = None,
 ) -> JSONResponse:
     error = {"type": type(exc).__name__, "message": str(exc)}
-    persist_openai_trace(
+    await run_db(
+        persist_openai_trace,
         session_factory,
         trace_id,
         payload,
@@ -538,6 +599,7 @@ async def chat_completions(request: Request):
     started_at = datetime.now(UTC)
     settings = request.app.state.settings
     session_factory = request.app.state.session_factory
+    await run_db(ensure_trace_id_not_running_replay, session_factory, trace_id)
     budget = settings.gateway_daily_token_budget
     if (
         not request.headers.get("X-Upstream-Base")
@@ -545,7 +607,8 @@ async def chat_completions(request: Request):
         and daily_token_usage(session_factory) >= budget
     ):
         error = {"type": "DailyTokenBudgetExceeded", "message": "每日 Token 预算已用尽"}
-        persist_openai_trace(
+        await run_db(
+            persist_openai_trace,
             session_factory,
             trace_id,
             payload,
@@ -624,7 +687,7 @@ async def chat_completions(request: Request):
                 if candidate.explicit
                 else gateway_metadata(candidate, settings, requested_model, attempts, None)
             )
-            return network_failure_response(
+            return await network_failure_response(
                 session_factory,
                 trace_id,
                 attempt_payload,
@@ -679,7 +742,8 @@ async def chat_completions(request: Request):
                 if candidate.explicit
                 else gateway_metadata(candidate, settings, requested_model, attempts, output)
             )
-            persist_openai_trace(
+            await run_db(
+                persist_openai_trace,
                 session_factory,
                 trace_id,
                 attempt_payload,
@@ -727,7 +791,8 @@ async def chat_completions(request: Request):
             if candidate.explicit
             else gateway_metadata(candidate, settings, requested_model, attempts, output)
         )
-        persist_openai_trace(
+        await run_db(
+            persist_openai_trace,
             session_factory,
             trace_id,
             attempt_payload,
@@ -748,7 +813,8 @@ async def chat_completions(request: Request):
     candidate = candidates[0]
     error = {"type": "CircuitOpen", "message": "所有匹配路由均处于熔断冷却期"}
     gateway = gateway_metadata(candidate, settings, requested_model, attempts, None)
-    persist_openai_trace(
+    await run_db(
+        persist_openai_trace,
         session_factory,
         trace_id,
         payload,

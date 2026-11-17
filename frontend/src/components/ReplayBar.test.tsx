@@ -40,4 +40,16 @@ describe('回放控制交互', () => {
     expect(screen.getByText('步骤 3')).toBeInTheDocument();
     expect(onActiveChange).toHaveBeenLastCalledWith('s3');
   });
+
+  it('Span 名称在下拉选项与当前节点标题中均脱敏', () => {
+    const secretName = '节点 Bearer bar-name-secret 与 sk-bar-name-123456';
+    render(<ReplayBar spans={[{ ...spans[0], name: secretName, sequence: 0 }]} onActiveChange={vi.fn()} />);
+
+    const select = screen.getByRole('combobox', { name: '跳转 Span' });
+    expect(select).toHaveTextContent('1. 节点 Bearer [已隐藏] 与 [已隐藏]');
+    const currentName = screen.getByText('节点 Bearer [已隐藏] 与 [已隐藏]');
+    expect(currentName).toHaveAttribute('title', '节点 Bearer [已隐藏] 与 [已隐藏]');
+    expect(document.body).not.toHaveTextContent('bar-name-secret');
+    expect(document.body).not.toHaveTextContent('sk-bar-name-123456');
+  });
 });

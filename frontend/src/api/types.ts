@@ -5,6 +5,7 @@ export type Severity = 'low' | 'medium' | 'high' | 'critical' | string;
 
 export interface Trace {
   id: string;
+  parent_id?: string | null;
   name: string;
   source: string;
   status: TraceStatus;
@@ -20,9 +21,10 @@ export interface Trace {
   estimated_cost_usd?: number;
   tags: string[];
   metadata: Record<string, JsonValue>;
-  error: string | null;
+  error: JsonValue;
   risk_count: number;
   span_count: number;
+  created_at?: string;
 }
 
 export interface Span {
@@ -46,7 +48,7 @@ export interface Span {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
-  error: string | null;
+  error: JsonValue;
   metadata: Record<string, JsonValue>;
 }
 
@@ -64,7 +66,7 @@ export interface ReplaySpanRequest {
 }
 
 export interface ReplayComparison {
-  status: 'equal' | 'different';
+  status: 'same' | 'different' | 'failed';
   content_equal: boolean;
   reasoning_equal: boolean;
   tool_calls_equal: boolean;

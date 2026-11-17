@@ -6,6 +6,8 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
+from .async_db import run_db
+from .audit import ensure_trace_id_not_running_replay, ensure_trace_not_running_replay
 from .models import Span, Trace
 from .proxy import HOP_BY_HOP, forward_response_headers, request_json_object
 from .rules import run_rules
@@ -49,6 +51,7 @@ def persist_mcp(
         protocol_error = output
     failed = protocol_error is not None
     with session_factory() as session:
+        ensure_trace_not_running_replay(session, trace_id)
         trace = session.get(Trace, trace_id)
         if trace is None:
             trace = Trace(
@@ -134,6 +137,11 @@ async def mcp_proxy(request: Request, path: str = ""):
     body = await request.body()
     trace_id = request.headers.get("X-AgentTrace-Id", str(uuid4()))
     started_at = datetime.now(UTC)
+    await run_db(
+        ensure_trace_id_not_running_replay,
+        request.app.state.session_factory,
+        trace_id,
+    )
     _ = path
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -149,7 +157,8 @@ async def mcp_proxy(request: Request, path: str = ""):
             )
     except httpx.HTTPError as exc:
         output = {"type": type(exc).__name__, "message": str(exc)}
-        persist_mcp(
+        await run_db(
+            persist_mcp,
             request.app.state.session_factory,
             trace_id,
             payload,
@@ -166,7 +175,8 @@ async def mcp_proxy(request: Request, path: str = ""):
         output = upstream.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
         output = {"content": upstream.content.decode(errors="replace")}
-    persist_mcp(
+    await run_db(
+        persist_mcp,
         request.app.state.session_factory,
         trace_id,
         payload,

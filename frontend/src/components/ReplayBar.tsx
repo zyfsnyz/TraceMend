@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { ChevronLeft, ChevronRight, Pause, Play } from 'lucide-react';
 import type { Span } from '../api/types';
 import { initialReplayState, transitionReplay, type ReplayAction, type ReplayState } from '../lib/replay';
+import { stringifySafe } from '../lib/sensitive';
 
 interface ReplayBarProps {
   spans: Span[];
@@ -14,6 +15,7 @@ export function ReplayBar({ spans, activeSpanId, onActiveChange }: ReplayBarProp
   const [state, setState] = useState<ReplayState>(initialReplayState);
   const current = ordered[state.index];
   const currentId = current?.id ?? null;
+  const currentName = current ? stringifySafe(current.name) : '暂无可回放步骤';
 
   useEffect(() => onActiveChange(currentId), [currentId, onActiveChange]);
   useEffect(() => setState(initialReplayState), [spans]);
@@ -52,10 +54,10 @@ export function ReplayBar({ spans, activeSpanId, onActiveChange }: ReplayBarProp
         }}
       >
         {!ordered.length && <option value="">暂无步骤</option>}
-        {ordered.map((span, index) => <option key={span.id} value={span.id}>{index + 1}. {span.name}</option>)}
+        {ordered.map((span, index) => <option key={span.id} value={span.id}>{index + 1}. {stringifySafe(span.name)}</option>)}
       </select>
       <span className="w-14 text-center font-mono text-xs font-semibold text-slate-600">{ordered.length ? state.index + 1 : 0} / {ordered.length}</span>
-      <span className="hidden max-w-44 truncate text-xs text-slate-500 lg:inline" title={current?.name}>{current?.name ?? '暂无可回放步骤'}</span>
+      <span className="hidden max-w-44 truncate text-xs text-slate-500 lg:inline" title={current ? currentName : undefined}>{currentName}</span>
     </div>
   );
 }

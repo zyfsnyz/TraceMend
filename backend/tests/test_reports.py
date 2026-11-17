@@ -58,7 +58,7 @@ async def test_markdown_report_is_readable_and_redacted(client):
     assert "text/markdown" in response.headers["content-type"]
     assert "attachment" in response.headers["content-disposition"]
     body = response.text
-    assert "# AgentTrace 审计报告" in body
+    assert "# TraceMend 审计报告" in body
     assert "差旅助手合规复盘" in body
     assert "执行摘要" in body
     assert "工具调用异常" in body
@@ -110,7 +110,7 @@ async def test_report_download_filename_is_ascii_for_non_ascii_trace_id(client, 
     assert "attachment" in disposition
     encoded = disposition.encode("latin-1")
     assert re.fullmatch(
-        r'attachment; filename="agenttrace-[A-Za-z0-9._-]+\.(?:md|pdf)"', disposition
+        r'attachment; filename="tracemend-[A-Za-z0-9._-]+\.(?:md|pdf)"', disposition
     )
     assert encoded
 

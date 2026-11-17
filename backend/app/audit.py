@@ -1,7 +1,8 @@
-from sqlalchemy import select
+from fastapi import HTTPException
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, selectinload
 
-from .models import Span, Trace
+from .models import ReplayReservation, Span, Trace
 from .rules import run_rules
 from .schemas import IngestIn, SpanIn, TraceIn
 
@@ -73,7 +74,27 @@ def make_span(data: SpanIn, trace_id: str) -> Span:
     return span
 
 
+def begin_write_transaction(session: Session) -> None:
+    """Serialize SQLite writers before any reservation check or evidence write."""
+    if session.get_bind().dialect.name == "sqlite":
+        session.execute(text("BEGIN IMMEDIATE"))
+
+
+def ensure_trace_not_running_replay(session: Session, trace_id: str) -> None:
+    """Protect the server-owned evidence window with an atomic write lock."""
+    begin_write_transaction(session)
+    reservation = session.get(ReplayReservation, trace_id)
+    if reservation is not None and reservation.status == "running":
+        raise HTTPException(status_code=409, detail="重放执行期间禁止修改或删除其审计链路")
+
+
+def ensure_trace_id_not_running_replay(session_factory, trace_id: str) -> None:
+    with session_factory() as session:
+        ensure_trace_not_running_replay(session, trace_id)
+
+
 def ingest(session: Session, payload: IngestIn) -> tuple[Trace, int]:
+    ensure_trace_not_running_replay(session, payload.trace.id)
     trace = session.get(Trace, payload.trace.id)
     if trace is None:
         trace = Trace(id=payload.trace.id)

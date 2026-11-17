@@ -1,6 +1,6 @@
-"""把 OpenAI Python SDK 的 base_url 指向 AgentTrace。
+"""把 OpenAI Python SDK 的 base_url 指向 TraceMend。
 
-密钥会先发送给所配置的 AgentTrace 实例，再由其转发给上游；只使用可信实例。
+密钥会先发送给所配置的 TraceMend 实例，再由其转发给上游；只使用可信实例。
 远程实例必须使用 TLS（https），不要在明文远程连接中提供真实密钥。
 """
 
@@ -10,7 +10,7 @@ from openai import OpenAI
 
 api_key = os.environ.get("OPENAI_API_KEY")
 if not api_key:
-    raise SystemExit("请先设置 OPENAI_API_KEY；密钥会先发送给所配置的 AgentTrace，再转发上游。")
+    raise SystemExit("请先设置 OPENAI_API_KEY；密钥会先发送给所配置的 TraceMend，再转发上游。")
 
 client = OpenAI(
     api_key=api_key,
